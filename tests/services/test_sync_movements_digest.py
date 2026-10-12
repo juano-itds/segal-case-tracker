@@ -84,3 +84,36 @@ def test_digest_failure_does_not_break_sync_and_alerts_stay_unmarked(db):
     rows = db.query(Alert).filter(Alert.type == "new_movement").all()
     assert len(rows) == 2
     assert not any(a.email_sent for a in rows)
+
+
+def test_a_sent_digest_marks_email_sent_durably_not_just_in_the_session(db):
+    """The batch flushes its digests in ``close()``, AFTER the last commit of
+    the sync path (``sync_via_consulta`` has none at all). A mark that is only
+    flushed is discarded when the session ends, so the email would have gone
+    out while the database still said it never did -- and ``email_sent=false``
+    is the flag that means "deliberately not sent", not "pending".
+    """
+    from app.services.notification_service import NotificationService
+
+    lawyer, (case, _) = _setup(db)
+    svc = NotificationService(db)
+    with patch("app.services.notification_service.settings") as st, patch(
+        "app.services.notification_service.smtplib.SMTP"
+    ) as MockSMTP:
+        st.SMTP_HOST = "smtp.x.cl"; st.SMTP_PORT = 587; st.SMTP_USER = ""
+        st.SMTP_PASSWORD = ""; st.SMTP_USE_TLS = False
+        st.SMTP_FROM = "n@segal.cl"; st.FROM_EMAIL = "n@segal.cl"
+        SyncService(db).sync_movements(
+            case.id, [_mov(i) for i in range(3)], notification_svc=svc
+        )
+        svc.close()
+        assert MockSMTP.return_value.send_message.call_count == 1
+
+    # Nothing commits after the batch returns: a session closed with pending
+    # work discards it.
+    db.rollback()
+
+    rows = db.query(Alert).filter(Alert.type == "new_movement").all()
+    assert len(rows) == 3
+    assert all(a.email_sent for a in rows)
+    assert all(a.email_sent_at is not None for a in rows)

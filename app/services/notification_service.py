@@ -342,7 +342,19 @@ class NotificationService:
         for entry in entries:
             entry.alert.email_sent = True
             entry.alert.email_sent_at = sent_at
-        self.db.flush()
+        # COMMIT, not flush. The digest is flushed at the END of the batch, past
+        # the last commit of the sync path (``sync_via_consulta`` has none after
+        # it at all), so a mark that is only flushed dies with the session: the
+        # email would have left while the database still said it never did. And
+        # ``email_sent=false`` does not mean "pending" here, it means
+        # "deliberately not sent" -- a lie in that column is read as a decision.
+        try:
+            self.db.commit()
+        except Exception:
+            # Keep the session usable for the next lawyer's digest; the caller
+            # logs and moves on, leaving these alerts honestly unmarked.
+            self.db.rollback()
+            raise
         logger.info(
             "Movement digest sent to lawyer %s: %d movements",
             getattr(lawyer, "id", None),
