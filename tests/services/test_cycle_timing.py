@@ -81,11 +81,13 @@ class TestInstrumentationPoints:
         monkeypatch.setattr(settings, "SMTP_USER", "")
         monkeypatch.setattr(settings, "SMTP_USE_TLS", False)
 
+        # The service holds the connection and reuses it across the batch, so
+        # SMTP() returns the server itself and is no longer entered as a
+        # context manager. Connect + login are inside the "email" bucket too,
+        # on purpose: they are the cost this instrumentation exists to expose.
         server = MagicMock()
         server.send_message.side_effect = lambda msg: clock.advance(12)
-        smtp_cm = MagicMock()
-        smtp_cm.__enter__.return_value = server
-        monkeypatch.setattr(smtplib, "SMTP", MagicMock(return_value=smtp_cm))
+        monkeypatch.setattr(smtplib, "SMTP", MagicMock(return_value=server))
 
         alert = MagicMock(title="t", message="m", id=1)
         lawyer = MagicMock(email="a@example.com", id=1)

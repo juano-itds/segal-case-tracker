@@ -143,7 +143,9 @@ class TestSendEmailAlert:
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
             with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
-                server = MockSMTP.return_value.__enter__.return_value
+                # The connection is now held by the service and reused across
+                # the batch, so it is no longer entered as a context manager.
+                server = MockSMTP.return_value
                 result = service.send_email_alert(alert, lawyer)
 
         assert result is True
@@ -168,7 +170,7 @@ class TestSendEmailAlert:
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
             with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
-                MockSMTP.return_value.__enter__.return_value.send_message.side_effect = Exception("SMTP down")
+                MockSMTP.return_value.send_message.side_effect = Exception("SMTP down")
                 result = service.send_email_alert(alert, lawyer)
 
         assert result is False
@@ -514,3 +516,90 @@ class TestNotifyNewExhorto:
                 service.notify_new_exhorto(case, exhorto_row, lawyer, [_make_webhook()], alert)
 
         assert captured[0]["event"] == "exhorto.created"
+
+
+# ---------------------------------------------------------------------------
+# SMTP connection reuse
+#
+# Measured 2026-10-12: a fresh connection + TLS handshake + login per email
+# cost ~3.4s each. With 407 emails in a sync that was 23 minutes, which made
+# `email` 51-55% of the whole scraping cycle -- more than the movements it is
+# supposed to be announcing. The connection is now opened once and reused.
+#
+# Two things must stay true, and they are why this is not a one-line change:
+# a stale connection must never silently swallow an email, and one bad
+# recipient must never kill the rest of the batch.
+# ---------------------------------------------------------------------------
+
+
+def _smtp_settings(mock_settings):
+    mock_settings.SMTP_HOST = "smtp.proveedor.cl"
+    mock_settings.SMTP_PORT = 587
+    mock_settings.SMTP_USER = "user@segal.cl"
+    mock_settings.SMTP_PASSWORD = "secret"
+    mock_settings.SMTP_USE_TLS = True
+    mock_settings.SMTP_FROM = "notificaciones@segal.cl"
+    mock_settings.FROM_EMAIL = "from@segal.cl"
+
+
+class TestSmtpConnectionIsReused:
+    def test_two_emails_open_one_connection_and_log_in_once(self, service):
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                server = MockSMTP.return_value
+                assert service.send_email_alert(_make_alert(), _make_lawyer()) is True
+                assert service.send_email_alert(_make_alert(), _make_lawyer()) is True
+
+        assert MockSMTP.call_count == 1, "a second connection was opened"
+        assert server.starttls.call_count == 1
+        assert server.login.call_count == 1
+        assert server.send_message.call_count == 2
+
+    def test_a_dropped_connection_is_reopened_and_the_email_still_goes_out(self, service):
+        """The provider closes idle connections. The email must NOT be lost:
+        reconnect once and send it."""
+        import smtplib as real_smtplib
+
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                dead, fresh = MagicMock(), MagicMock()
+                dead.send_message.side_effect = real_smtplib.SMTPServerDisconnected("bye")
+                MockSMTP.side_effect = [dead, fresh]
+
+                assert service.send_email_alert(_make_alert(), _make_lawyer()) is True
+
+        assert MockSMTP.call_count == 2, "it did not reconnect"
+        fresh.send_message.assert_called_once()
+
+    def test_one_rejected_recipient_does_not_kill_the_rest_of_the_batch(self, service):
+        """A bad address is not a broken connection. The next email must go out
+        on the SAME connection, without reconnecting."""
+        import smtplib as real_smtplib
+
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                server = MockSMTP.return_value
+                server.send_message.side_effect = [
+                    real_smtplib.SMTPRecipientsRefused({"x@y.cl": (550, b"no such user")}),
+                    None,
+                ]
+                first = service.send_email_alert(_make_alert(), _make_lawyer())
+                second = service.send_email_alert(_make_alert(), _make_lawyer())
+
+        assert first is False
+        assert second is True
+        assert MockSMTP.call_count == 1, "a recipient error should not reconnect"
+
+    def test_close_releases_the_connection(self, service):
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                server = MockSMTP.return_value
+                service.send_email_alert(_make_alert(), _make_lawyer())
+                service.close()
+
+        server.quit.assert_called_once()
+        assert service._smtp is None

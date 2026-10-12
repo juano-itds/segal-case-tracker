@@ -2293,6 +2293,13 @@ async def detect_and_sync_movements(
     # The listing phase ran before this function; only detail time counts.
     batch_started_at = DETAIL_BATCH_CLOCK()
 
+    # ONE NotificationService -- and therefore ONE SMTP connection -- for the
+    # whole batch. It used to be built inside the per-case `_do_fetch` closure,
+    # so a batch of 80 causas opened 80 connections; combined with a fresh
+    # connection per email that made `email` 51-55% of the cycle (measured
+    # 2026-10-12, ~3.4s per email over 407 emails). Closed before the return.
+    notification_svc = NotificationService(db)
+
     for api_case in cases_for_check:
         elapsed = DETAIL_BATCH_CLOCK() - batch_started_at
         if elapsed >= DETAIL_BATCH_MAX_SECONDS:
@@ -2390,7 +2397,6 @@ async def detect_and_sync_movements(
 
             # Shared budget across movements + all entity types (ADR-005).
             shared_budget = NotifyBudget.from_settings()
-            notification_svc = NotificationService(db)
 
             new_count = 0
             alert_count = 0
@@ -2852,6 +2858,11 @@ async def detect_and_sync_movements(
         alerts_created=alerts_created,
         errors=len(errors),
     )
+    # Release the shared SMTP connection. A send that finds it dropped
+    # reconnects on its own, so an exceptional path that skips this leaks one
+    # idle connection the provider reaps -- it never costs an email.
+    notification_svc.close()
+
     return movements_new, alerts_created, errors
 
 
