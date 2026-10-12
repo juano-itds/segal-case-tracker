@@ -1035,6 +1035,7 @@ class SyncService:
         scraped_movements: List[ScrapedMovement],
         *,
         budget: Optional[NotifyBudget] = None,
+        notification_svc: Optional[NotificationService] = None,
     ) -> Tuple[int, int]:
         """Sync movements for a case, detecting new ones.
 
@@ -1045,6 +1046,11 @@ class SyncService:
                     caller's budget is drained instead of a local one.  When
                     omitted (existing callers), a fresh local budget is created
                     from settings.NOTIFY_MAX_PER_SYNC — backward compatible.
+            notification_svc: Optional shared NotificationService. New-movement
+                    emails accumulate in it and go out as ONE digest per lawyer
+                    when its owner flushes/closes it (the sync batch does).
+                    When omitted, a local one is used and flushed before this
+                    method returns, so no email is ever left behind.
 
         Returns:
             Tuple of (new_count, alert_count).
@@ -1104,6 +1110,13 @@ class SyncService:
             .all()
         }
 
+        # One service for every movement of this call (it used to be a new one
+        # per movement). Emails accumulate in it; if we own it, it is flushed
+        # and closed right after the loop. Deliberately NOT in a ``finally``:
+        # if the loop raises, the caller rolls the movements back and a digest
+        # must not announce movements that were never persisted.
+        owns_svc = notification_svc is None
+        svc = notification_svc
         for scraped in scraped_movements:
             movement, is_new = self._upsert_movement(
                 case_id, scraped, existing_by_key=existing_movements
@@ -1118,7 +1131,9 @@ class SyncService:
                     alert_count += 1
                     if not _budget.exhausted():
                         try:
-                            NotificationService(self.db).notify_new_movement(
+                            if svc is None:
+                                svc = NotificationService(self.db)
+                            svc.notify_new_movement(
                                 alert, case, movement, recipient,
                                 recipient_webhooks[recipient.id],
                             )
@@ -1131,6 +1146,9 @@ class SyncService:
                         # Count every attempt (success or error) toward the cap.
                         _budget.decrement()
                         notify_dispatched += 1
+
+        if owns_svc and svc is not None:
+            svc.close()  # flushes the digest, then releases SMTP; never raises
 
         # Emit a warning when the cap prevented some dispatches.
         if alert_count > notify_dispatched:
@@ -2407,6 +2425,7 @@ async def detect_and_sync_movements(
                     case_id=int(db_case.id),
                     scraped_movements=scraped_movements,
                     budget=shared_budget,
+                    notification_svc=notification_svc,
                 )
                 logger.info(
                     "detect_and_sync_movements: %s → %d new movements, %d alerts",
@@ -2861,6 +2880,9 @@ async def detect_and_sync_movements(
     # Release the shared SMTP connection. A send that finds it dropped
     # reconnects on its own, so an exceptional path that skips this leaks one
     # idle connection the provider reaps -- it never costs an email.
+    #
+    # close() first sends the batch's movement digests (one email per lawyer),
+    # so this is the end-of-batch flush point.
     notification_svc.close()
 
     return movements_new, alerts_created, errors
@@ -3009,6 +3031,7 @@ async def sync_via_consulta(
                         case_id=int(case.id),
                         scraped_movements=scraped_movements,
                         budget=shared_budget,
+                        notification_svc=notification_svc,
                     )
                     created_movements += new_count
                     alerts_created += alert_count
@@ -3096,4 +3119,6 @@ async def sync_via_consulta(
         "sync_via_consulta: done — %d new movements, %d alerts, %d reserved, %d errors",
         created_movements, alerts_created, reserved, errors,
     )
+    # Send the batch's movement digests and release the SMTP connection.
+    notification_svc.close()
     return created_movements, alerts_created, reserved, errors
