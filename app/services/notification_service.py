@@ -8,7 +8,7 @@ import smtplib
 import ssl
 from datetime import datetime
 from email.message import EmailMessage
-from typing import List
+from typing import List, Optional
 
 import httpx
 from sqlalchemy.orm import Session
@@ -32,6 +32,48 @@ class NotificationService:
 
     def __init__(self, db: Session):
         self.db = db
+        # One SMTP connection reused across the batch. Measured 2026-10-12: a
+        # fresh connection + TLS handshake + login per email cost ~3.4s, so 407
+        # emails in a sync took 23 minutes and made `email` 51-55% of the whole
+        # scraping cycle -- more than the movements it announces.
+        self._smtp: Optional[smtplib.SMTP] = None
+
+    # ------------------------------------------------------------------
+    # SMTP connection lifecycle
+    # ------------------------------------------------------------------
+
+    def _connect_smtp(self) -> smtplib.SMTP:
+        """Open and authenticate one SMTP connection."""
+        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10)
+        if settings.SMTP_USE_TLS:
+            server.starttls(context=ssl.create_default_context())
+        if settings.SMTP_USER:
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        return server
+
+    def _smtp_connection(self) -> smtplib.SMTP:
+        if self._smtp is None:
+            self._smtp = self._connect_smtp()
+        return self._smtp
+
+    def _drop_smtp(self) -> None:
+        """Forget the current connection; the next send opens a fresh one."""
+        server, self._smtp = self._smtp, None
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:  # noqa: BLE001 — already broken, nothing to save
+                pass
+
+    def close(self) -> None:
+        """Release the shared connection. Safe to call more than once."""
+        self._drop_smtp()
+
+    def __enter__(self) -> "NotificationService":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -68,15 +110,26 @@ class NotificationService:
             msg["To"] = lawyer.email
             msg.set_content(alert.message)
 
-            context = ssl.create_default_context()
             # Charged to the cycle's "email" bucket (no-op outside a worker cycle).
             with timed("email"):
-                with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
-                    if settings.SMTP_USE_TLS:
-                        server.starttls(context=context)
-                    if settings.SMTP_USER:
-                        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-                    server.send_message(msg)
+                try:
+                    self._smtp_connection().send_message(msg)
+                except (
+                    smtplib.SMTPServerDisconnected,
+                    smtplib.SMTPConnectError,
+                    ConnectionError,
+                    TimeoutError,
+                ):
+                    # The provider closes idle connections. That must never cost
+                    # an email: drop the dead one, reconnect and send once more.
+                    #
+                    # NOT `OSError`: smtplib.SMTPException inherits from it, so
+                    # catching OSError would also catch a refused recipient --
+                    # a protocol answer, not a broken pipe -- and tear down the
+                    # connection the rest of the batch is still using. A test
+                    # covers exactly that.
+                    self._drop_smtp()
+                    self._smtp_connection().send_message(msg)
 
             alert.email_sent = True
             alert.email_sent_at = datetime.utcnow()
