@@ -138,6 +138,15 @@ class Case(Base):
     # scraping mientras siga sin cobertura.
     poda_at = Column(DateTime, nullable=True)
     poda_motivo = Column(String(255), nullable=True)
+
+    # Listing fingerprint (experiment, migration 066): sha256 of the "Mis
+    # Causas" row cells (case_token excluded) plus the raw estado/cuaderno
+    # cells that _map_status collapses. Written only when the fingerprint
+    # changes. See app.services.listing_fingerprint.
+    listing_fingerprint = Column(String(64), nullable=True)
+    listing_fingerprint_at = Column(DateTime, nullable=True)
+    listing_estado_raw = Column(String(255), nullable=True)
+    listing_cuaderno_raw = Column(String(255), nullable=True)
     poda_por_rut = Column(String(20), nullable=True)  # RUT de quien ejecutó la poda
 
     # Timestamps
