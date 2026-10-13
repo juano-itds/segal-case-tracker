@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.services.movement_digest import DigestBucket
 from app.services.notification_service import NotificationService
 from tests.services.test_notification_service import (
     _make_alert,
@@ -140,7 +141,7 @@ class TestEmptyDigest:
         assert MockSMTP.call_count == 0, "must not even open a connection"
 
     def test_an_empty_bucket_never_produces_an_email(self, service):
-        service._digests = {99: (_make_lawyer(), [])}
+        service._digests = {99: (_make_lawyer(), DigestBucket())}
         MockSMTP, server = _flush_capturing(service)
         assert server.send_message.call_count == 0
 

@@ -1129,7 +1129,22 @@ class SyncService:
                     if not alert:
                         continue
                     alert_count += 1
-                    if not _budget.exhausted():
+                    if _budget.exhausted():
+                        # The budget caps WEBHOOKS (a real HTTP POST per event).
+                        # The digest is one email per lawyer however many
+                        # movements it carries, so it still counts this one.
+                        try:
+                            if svc is None:
+                                svc = NotificationService(self.db)
+                            svc.accumulate_movement(
+                                alert, case, movement, recipient
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to queue movement digest entry for "
+                                "alert %s: %s", alert.id, exc,
+                            )
+                    else:
                         try:
                             if svc is None:
                                 svc = NotificationService(self.db)
@@ -1156,7 +1171,8 @@ class SyncService:
             logger.warning(
                 "Notification cap reached in sync_movements (case_id=%s): "
                 "dispatched %d of %d notifications, skipped %d. "
-                "Increase NOTIFY_MAX_PER_SYNC (currently %d) to raise the limit.",
+                "Increase NOTIFY_MAX_PER_SYNC (currently %d) to raise the limit. "
+                "(Webhooks only: the skipped movements still count in the digest.)",
                 case_id,
                 notify_dispatched,
                 alert_count,

@@ -39,7 +39,7 @@ class NotificationService:
         self._smtp: Optional[smtplib.SMTP] = None
         # New-movement emails are not sent one by one: they accumulate here,
         # keyed by lawyer id, and go out as ONE digest per lawyer (see
-        # ``flush_digests``). Value: (lawyer, [DigestEntry, ...]).
+        # ``flush_digests``). Value: (lawyer, DigestBucket).
         self._digests: Dict[Any, Tuple[Lawyer, list]] = {}
 
     # ------------------------------------------------------------------
@@ -258,14 +258,19 @@ class NotificationService:
         }
 
         self._dispatch(alert, lawyer, webhooks, payload, send_email=False)
-        self._accumulate_movement(alert, case, movement, lawyer)
+        self.accumulate_movement(alert, case, movement, lawyer)
 
-    def _accumulate_movement(
+    def accumulate_movement(
         self, alert: Alert, case: Case, movement: Movement, lawyer: Lawyer
     ) -> None:
-        """Queue one movement for the lawyer's digest. Never raises."""
+        """Queue one movement for the lawyer's digest. Never raises.
+
+        Public so the sync can feed the digest for movements whose webhook
+        dispatch the per-case ``NotifyBudget`` skipped: the budget caps
+        webhooks, it must not decide what the email counts.
+        """
         try:
-            from app.services.movement_digest import DigestEntry
+            from app.services.movement_digest import DigestBucket, DigestEntry
 
             entry = DigestEntry(
                 alert=alert,
@@ -281,7 +286,7 @@ class NotificationService:
                 procedure=movement.procedure or "",
                 description=movement.description or "",
             )
-            self._digests.setdefault(lawyer.id, (lawyer, []))[1].append(entry)
+            self._digests.setdefault(lawyer.id, (lawyer, DigestBucket()))[1].add(entry)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Could not queue movement for digest (alert %s): %s",
@@ -299,9 +304,9 @@ class NotificationService:
         must not break the sync cycle.
         """
         pending, self._digests = self._digests, {}
-        for lawyer, entries in pending.values():
+        for lawyer, bucket in pending.values():
             try:
-                self._send_digest(lawyer, entries)
+                self._send_digest(lawyer, bucket)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Failed to send movement digest to lawyer %s: %s",
@@ -309,10 +314,10 @@ class NotificationService:
                     exc,
                 )
 
-    def _send_digest(self, lawyer: Lawyer, entries: list) -> bool:
+    def _send_digest(self, lawyer: Lawyer, bucket: Any) -> bool:
         from app.services.movement_digest import render_movement_digest
 
-        if not entries:
+        if not bucket.total_movements:
             return False  # never send "0 movimientos nuevos"
         if not settings.SMTP_HOST:
             logger.warning(
@@ -327,7 +332,7 @@ class NotificationService:
             )
             return False
 
-        subject, html_body, text_body = render_movement_digest(lawyer, entries)
+        subject, html_body, text_body = render_movement_digest(lawyer, bucket)
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
@@ -339,7 +344,9 @@ class NotificationService:
 
         # Only now -- the digest really left -- mark the alerts it covered.
         sent_at = datetime.utcnow()
-        for entry in entries:
+        # Only the alerts actually rendered: the ones that merely fed the "y N
+        # más" counter stay false ("deliberately not sent", never a lie).
+        for entry in bucket.entries:
             entry.alert.email_sent = True
             entry.alert.email_sent_at = sent_at
         # COMMIT, not flush. The digest is flushed at the END of the batch, past
@@ -356,9 +363,10 @@ class NotificationService:
             self.db.rollback()
             raise
         logger.info(
-            "Movement digest sent to lawyer %s: %d movements",
+            "Movement digest sent to lawyer %s: %d movements (%d rendered)",
             getattr(lawyer, "id", None),
-            len(entries),
+            bucket.total_movements,
+            len(bucket.entries),
         )
         return True
 
