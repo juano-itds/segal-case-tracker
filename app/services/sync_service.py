@@ -18,6 +18,7 @@ import logging
 import random
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
@@ -121,7 +122,12 @@ from app.scrapper.pjud.exceptions import (
     TransientNavigationError,
 )
 from app.services.shape_cooldown import get_shape_cooldown
-from app.services.deadline_engine import DeadlineEngine, SemaforoTransition, _today_chile
+from app.services.deadline_engine import (
+    DeadlineEngine,
+    LoadedMovements,
+    SemaforoTransition,
+    _today_chile,
+)
 from app.services.matriz_classifier import MatrizMappingCache, classify_case
 
 
@@ -2048,8 +2054,23 @@ def emit_ratification_alert(
         return 0
 
 
+@contextmanager
+def _expire_on_commit_disabled(db: Session):
+    """Disable ``expire_on_commit`` on *db* for the block, then restore it."""
+    original = db.expire_on_commit
+    db.expire_on_commit = False
+    try:
+        yield
+    finally:
+        db.expire_on_commit = original
+
+
 def _maybe_recompute_deadlines(
-    db: Session, case: Case, *, budget: Optional[NotifyBudget] = None
+    db: Session,
+    case: Case,
+    *,
+    budget: Optional[NotifyBudget] = None,
+    loaded: Optional[LoadedMovements] = None,
 ) -> None:
     """Recompute procedural deadlines for *case* after a movement sync, then
     fan out a ROJO-entry / fatal-deadline alert on a qualifying transition.
@@ -2067,11 +2088,20 @@ def _maybe_recompute_deadlines(
                 already tracks a per-sync-cycle budget (movements + entity
                 alerts), pass it through so deadline alerts drain the same
                 pool instead of getting their own independent cap.
+        loaded: Optional out-parameter that receives the case's movements as
+                the engine loaded them, so the matriz classification can reuse
+                them instead of querying again.
     """
     if (case.competencia or "").lower() != "civil":
         return
     try:
-        transition = DeadlineEngine.recompute_case(db, case)
+        # `loaded` is only forwarded when asked for, so every other caller keeps
+        # the exact two-argument call it always made.
+        transition = (
+            DeadlineEngine.recompute_case(db, case)
+            if loaded is None
+            else DeadlineEngine.recompute_case(db, case, loaded=loaded)
+        )
     except Exception:
         logger.exception(
             "_maybe_recompute_deadlines failed for case_id=%s; "
@@ -2093,7 +2123,11 @@ def _maybe_recompute_deadlines(
 
 
 def _maybe_classify_matriz(
-    db: Session, case: Case, *, mapping_cache: MatrizMappingCache
+    db: Session,
+    case: Case,
+    *,
+    mapping_cache: MatrizMappingCache,
+    movements: Optional[list] = None,
 ) -> None:
     """Recompute the matriz de clasificación (M1/M2/M3) for *case* after a
     movement sync — same call-site pattern as ``_maybe_recompute_deadlines``.
@@ -2110,11 +2144,16 @@ def _maybe_classify_matriz(
         db:            Active SQLAlchemy session (shared with the sync transaction).
         case:          Case ORM instance (already flushed, not yet committed).
         mapping_cache: Preloaded ``MatrizMappingCache`` for this run.
+        movements:     Optional — ALL of the case's movements, already loaded
+                       (see ``LoadedMovements``); the latest is then picked in
+                       Python instead of queried. ``None`` keeps the query.
     """
     if (case.competencia or "").lower() != "civil":
         return
     try:
-        result = classify_case(db, case, mapping_cache=mapping_cache)
+        result = classify_case(
+            db, case, mapping_cache=mapping_cache, movements=movements
+        )
     except Exception:
         logger.exception(
             "_maybe_classify_matriz failed for case_id=%s; "
@@ -2409,6 +2448,20 @@ async def detect_and_sync_movements(
         ).first()
 
         async def _do_fetch() -> Tuple[int, int]:
+            """Run ``_do_fetch_inner`` with ``expire_on_commit`` off.
+
+            Same pattern as ``SyncService.sync_cases``: the per-case work
+            commits more than once (after the movements, then after the
+            entities/documents/deadlines), and every commit would otherwise
+            expire the case, lawyer and court objects it just loaded, so the
+            next attribute access re-SELECTs them - round-trips of ~137 ms each
+            for rows that did not change. Restored in ``finally`` to whatever
+            the caller had, even when the case fails or is cancelled.
+            """
+            with _expire_on_commit_disabled(db):
+                return await _do_fetch_inner()
+
+        async def _do_fetch_inner() -> Tuple[int, int]:
             """Fetch case detail, sync movements/entities/documents for *api_case*.
 
             Reads ``pjud_session`` from the enclosing scope so that reassigning
@@ -2523,10 +2576,20 @@ async def detect_and_sync_movements(
             # Recompute procedural deadlines (civil only; flush-only; never raises).
             # Shares this call's NotifyBudget (ADR-005) so a ROJO-entry/fatal
             # alert drains the same per-sync-cycle pool as movements/entities.
-            _maybe_recompute_deadlines(db, db_case, budget=shared_budget)
+            # The engine hands back the movements it already loaded, so the
+            # matriz classification below needs no query of its own.
+            loaded_movements = LoadedMovements()
+            _maybe_recompute_deadlines(
+                db, db_case, budget=shared_budget, loaded=loaded_movements
+            )
 
             # Recompute matriz de clasificación (civil only; flush-only; never raises).
-            _maybe_classify_matriz(db, db_case, mapping_cache=matriz_cache)
+            _maybe_classify_matriz(
+                db,
+                db_case,
+                mapping_cache=matriz_cache,
+                movements=loaded_movements.movements,
+            )
 
             # Commit entity upserts + document tokens + mark-checked + deadlines.
             # (sync_movements already committed its own changes.)

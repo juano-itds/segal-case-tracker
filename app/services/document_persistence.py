@@ -188,7 +188,17 @@ class DocumentPersistenceService:
 
                 # Bug fix: write primary document token to Movement row. No per-item
                 # flush — deferred to the single flush after the loops.
-                if db_movement is not None and pjud_movement.documento_token:
+                # Only when the column is still empty: the JWT rotates on every
+                # PJUD load, so an unconditional write dirtied EVERY movement
+                # with a document on EVERY pass (one UPDATE round-trip each,
+                # ~137 ms over Cloud SQL). Nothing reads this column; the live
+                # JWT used to download a document is Document.pjud_token, which
+                # is still refreshed below.
+                if (
+                    db_movement is not None
+                    and pjud_movement.documento_token
+                    and not db_movement.document_token
+                ):
                     db_movement.document_token = pjud_movement.documento_token
 
                 movement_id = db_movement.id if db_movement is not None else None

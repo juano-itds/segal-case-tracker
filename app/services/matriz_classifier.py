@@ -76,7 +76,7 @@ import logging
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -265,11 +265,21 @@ class MatrizMappingCache:
 
 
 def classify_case(
-    db: Session, case: Case, *, mapping_cache: MatrizMappingCache
+    db: Session,
+    case: Case,
+    *,
+    mapping_cache: MatrizMappingCache,
+    movements: Optional[Sequence[Movement]] = None,
 ) -> MatrizResult:
-    """Classify *case* into a matriz. Never raises — see module docstring."""
+    """Classify *case* into a matriz. Never raises — see module docstring.
+
+    ``movements``, when given, must be ALL of the case's movements (any order);
+    the latest is then picked in Python instead of queried.
+    """
     try:
-        return _classify_case(db, case, mapping_cache=mapping_cache)
+        return _classify_case(
+            db, case, mapping_cache=mapping_cache, movements=movements
+        )
     except Exception:
         logger.exception(
             "matriz_classifier.classify_case failed for case_id=%s — returning indeterminate",
@@ -278,8 +288,27 @@ def classify_case(
         return MatrizResult(matriz=None, matriz_etapa=None, origen=ORIGEN_ERROR)
 
 
+def _latest_of(movements: Sequence[Movement]) -> Optional[Movement]:
+    """The most recent movement of an already-loaded list, with the SAME order
+    the SQL path uses: ``ORDER BY movement_date DESC, id DESC``.
+
+    Returns ``None`` for an empty list. Raises ``ValueError`` when the order
+    cannot be reproduced faithfully in Python (a missing date or id - SQL would
+    sort NULLs differently); callers then fall back to the query.
+    """
+    if not movements:
+        return None
+    if any(m.movement_date is None or m.id is None for m in movements):
+        raise ValueError("cannot order movements without date/id in Python")
+    return max(movements, key=lambda m: (m.movement_date, m.id))
+
+
 def _classify_case(
-    db: Session, case: Case, *, mapping_cache: MatrizMappingCache
+    db: Session,
+    case: Case,
+    *,
+    mapping_cache: MatrizMappingCache,
+    movements: Optional[Sequence[Movement]] = None,
 ) -> MatrizResult:
     procedure = (case.procedure or "").lower()
     if any(signal in procedure for signal in _APREMIO_PROCEDURE_SIGNALS):
@@ -289,7 +318,19 @@ def _classify_case(
     # stage on the latest movement is common (PJUD doesn't always tag one)
     # and is handled by the description fallback below, never by silently
     # falling back to an OLDER, possibly-stale movement's stage.
-    if case.id in mapping_cache.preloaded_case_ids:
+    last_movement = None
+    from_list = False
+    if movements is not None:
+        # The caller already holds ALL of this case's movements (the deadline
+        # engine loads them): no need for a round-trip to ask for the newest.
+        try:
+            last_movement = _latest_of(movements)
+            from_list = True
+        except ValueError:
+            pass  # order not reproducible in Python -> ask the database
+    if from_list:
+        pass
+    elif case.id in mapping_cache.preloaded_case_ids:
         last_movement = mapping_cache.latest_movement.get(case.id)
     else:
         last_movement = (
