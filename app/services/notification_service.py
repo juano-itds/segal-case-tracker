@@ -8,7 +8,7 @@ import smtplib
 import ssl
 from datetime import datetime
 from email.message import EmailMessage
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from sqlalchemy.orm import Session
@@ -37,6 +37,10 @@ class NotificationService:
         # emails in a sync took 23 minutes and made `email` 51-55% of the whole
         # scraping cycle -- more than the movements it announces.
         self._smtp: Optional[smtplib.SMTP] = None
+        # New-movement emails are not sent one by one: they accumulate here,
+        # keyed by lawyer id, and go out as ONE digest per lawyer (see
+        # ``flush_digests``). Value: (lawyer, [DigestEntry, ...]).
+        self._digests: Dict[Any, Tuple[Lawyer, list]] = {}
 
     # ------------------------------------------------------------------
     # SMTP connection lifecycle
@@ -66,7 +70,14 @@ class NotificationService:
                 pass
 
     def close(self) -> None:
-        """Release the shared connection. Safe to call more than once."""
+        """Flush any pending digests, then release the shared connection.
+
+        Flushing lives here (not only in the explicit ``flush_digests``) so the
+        safe thing is the default: a caller that forgets ``flush_digests`` and
+        just closes -- or leaves a ``with`` block -- still delivers every
+        accumulated email. Safe to call more than once; never raises.
+        """
+        self.flush_digests()
         self._drop_smtp()
 
     def __enter__(self) -> "NotificationService":
@@ -78,6 +89,30 @@ class NotificationService:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _deliver(self, msg: EmailMessage) -> None:
+        """Send one message on the shared connection, reconnecting once if the
+        provider dropped it. Raises on failure; callers own the error contract."""
+        # Charged to the cycle's "email" bucket (no-op outside a worker cycle).
+        with timed("email"):
+            try:
+                self._smtp_connection().send_message(msg)
+            except (
+                smtplib.SMTPServerDisconnected,
+                smtplib.SMTPConnectError,
+                ConnectionError,
+                TimeoutError,
+            ):
+                # The provider closes idle connections. That must never cost
+                # an email: drop the dead one, reconnect and send once more.
+                #
+                # NOT `OSError`: smtplib.SMTPException inherits from it, so
+                # catching OSError would also catch a refused recipient --
+                # a protocol answer, not a broken pipe -- and tear down the
+                # connection the rest of the batch is still using. A test
+                # covers exactly that.
+                self._drop_smtp()
+                self._smtp_connection().send_message(msg)
 
     def send_email_alert(self, alert: Alert, lawyer: Lawyer) -> bool:
         """
@@ -110,26 +145,7 @@ class NotificationService:
             msg["To"] = lawyer.email
             msg.set_content(alert.message)
 
-            # Charged to the cycle's "email" bucket (no-op outside a worker cycle).
-            with timed("email"):
-                try:
-                    self._smtp_connection().send_message(msg)
-                except (
-                    smtplib.SMTPServerDisconnected,
-                    smtplib.SMTPConnectError,
-                    ConnectionError,
-                    TimeoutError,
-                ):
-                    # The provider closes idle connections. That must never cost
-                    # an email: drop the dead one, reconnect and send once more.
-                    #
-                    # NOT `OSError`: smtplib.SMTPException inherits from it, so
-                    # catching OSError would also catch a refused recipient --
-                    # a protocol answer, not a broken pipe -- and tear down the
-                    # connection the rest of the batch is still using. A test
-                    # covers exactly that.
-                    self._drop_smtp()
-                    self._smtp_connection().send_message(msg)
+            self._deliver(msg)
 
             alert.email_sent = True
             alert.email_sent_at = datetime.utcnow()
@@ -201,8 +217,12 @@ class NotificationService:
         """
         Dispatch email + webhook notifications for a new movement.
 
-        Builds the v1 event payload, sends email via SendGrid, then fans out
-        to all active webhooks.  One channel failing never blocks the other.
+        Builds the v1 event payload and fans out to all active webhooks
+        IMMEDIATELY (they are machine consumers, one event per movement).
+        The EMAIL half is deferred: the movement is accumulated and goes out in
+        one digest per lawyer on ``flush_digests`` / ``close``. Only
+        ``new_movement`` is deferred -- actionable alerts (deadlines, semaforo,
+        status changes) keep using ``_dispatch`` and stay immediate.
         Never raises.
 
         Field-name notes vs. the raw PJUD concepts:
@@ -237,7 +257,110 @@ class NotificationService:
             },
         }
 
-        self._dispatch(alert, lawyer, webhooks, payload)
+        self._dispatch(alert, lawyer, webhooks, payload, send_email=False)
+        self._accumulate_movement(alert, case, movement, lawyer)
+
+    def _accumulate_movement(
+        self, alert: Alert, case: Case, movement: Movement, lawyer: Lawyer
+    ) -> None:
+        """Queue one movement for the lawyer's digest. Never raises."""
+        try:
+            from app.services.movement_digest import DigestEntry
+
+            entry = DigestEntry(
+                alert=alert,
+                case_id=case.id,
+                rol=case.rol or "",
+                caratulado=f"{case.plaintiff or ''}/{case.defendant or ''}",
+                court_name=case.court.name if case.court else "",
+                date_str=(
+                    movement.movement_date.strftime("%d-%m-%Y")
+                    if movement.movement_date
+                    else ""
+                ),
+                procedure=movement.procedure or "",
+                description=movement.description or "",
+            )
+            self._digests.setdefault(lawyer.id, (lawyer, []))[1].append(entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Could not queue movement for digest (alert %s): %s",
+                getattr(alert, "id", None),
+                exc,
+            )
+
+    def flush_digests(self) -> None:
+        """Send ONE digest email per lawyer for the movements accumulated so
+        far, then forget them.
+
+        Nothing accumulated -> no email. A lawyer with no email address, an
+        unconfigured SMTP or a failed send leaves ``alert.email_sent`` untouched
+        (the alerts stay persisted either way). Never raises: a digest failure
+        must not break the sync cycle.
+        """
+        pending, self._digests = self._digests, {}
+        for lawyer, entries in pending.values():
+            try:
+                self._send_digest(lawyer, entries)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to send movement digest to lawyer %s: %s",
+                    getattr(lawyer, "id", None),
+                    exc,
+                )
+
+    def _send_digest(self, lawyer: Lawyer, entries: list) -> bool:
+        from app.services.movement_digest import render_movement_digest
+
+        if not entries:
+            return False  # never send "0 movimientos nuevos"
+        if not settings.SMTP_HOST:
+            logger.warning(
+                "SMTP_HOST is not configured; skipping movement digest for lawyer %s",
+                getattr(lawyer, "id", None),
+            )
+            return False
+        if not lawyer.email:
+            logger.warning(
+                "Lawyer %s has no email; skipping movement digest",
+                getattr(lawyer, "id", None),
+            )
+            return False
+
+        subject, html_body, text_body = render_movement_digest(lawyer, entries)
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
+        msg["To"] = lawyer.email
+        msg.set_content(text_body)
+        msg.add_alternative(html_body, subtype="html")
+
+        self._deliver(msg)
+
+        # Only now -- the digest really left -- mark the alerts it covered.
+        sent_at = datetime.utcnow()
+        for entry in entries:
+            entry.alert.email_sent = True
+            entry.alert.email_sent_at = sent_at
+        # COMMIT, not flush. The digest is flushed at the END of the batch, past
+        # the last commit of the sync path (``sync_via_consulta`` has none after
+        # it at all), so a mark that is only flushed dies with the session: the
+        # email would have left while the database still said it never did. And
+        # ``email_sent=false`` does not mean "pending" here, it means
+        # "deliberately not sent" -- a lie in that column is read as a decision.
+        try:
+            self.db.commit()
+        except Exception:
+            # Keep the session usable for the next lawyer's digest; the caller
+            # logs and moves on, leaving these alerts honestly unmarked.
+            self.db.rollback()
+            raise
+        logger.info(
+            "Movement digest sent to lawyer %s: %d movements",
+            getattr(lawyer, "id", None),
+            len(entries),
+        )
+        return True
 
     def notify_new_notificacion(
         self,
@@ -389,6 +512,8 @@ class NotificationService:
         lawyer: Lawyer,
         webhooks: List[Webhook],
         payload: dict,
+        *,
+        send_email: bool = True,
     ) -> None:
         """Send email + fan out to all active webhooks.
 
@@ -397,13 +522,15 @@ class NotificationService:
         copy-pasted across every entity type.  One channel failing never
         blocks the other.  Never raises.
         """
-        # Email — failure must not block webhooks
-        try:
-            self.send_email_alert(alert, lawyer)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Unexpected error sending email for alert %s: %s", alert.id, exc
-            )
+        # Email — failure must not block webhooks. ``send_email=False`` is used
+        # by the digest path, which sends its own email later.
+        if send_email:
+            try:
+                self.send_email_alert(alert, lawyer)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Unexpected error sending email for alert %s: %s", alert.id, exc
+                )
 
         # Webhooks — each failure is isolated
         webhook_success = False

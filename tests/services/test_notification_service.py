@@ -261,7 +261,7 @@ class TestSendWebhook:
 
 class TestNotifyNewMovement:
     def test_dispatches_both_channels_and_sets_webhook_sent(self, service):
-        """Both send_email_alert and send_webhook are called; payload structure is correct;
+        """The webhook fires immediately and send_email_alert is NOT called; payload structure is correct;
         alert.webhook_sent=True when a webhook succeeds."""
         alert = _make_alert()
         case = _make_case()
@@ -273,8 +273,9 @@ class TestNotifyNewMovement:
             with patch.object(service, "send_webhook", return_value=True) as mock_wh:
                 service.notify_new_movement(alert, case, movement, lawyer, [webhook])
 
-        # Email channel
-        mock_email.assert_called_once_with(alert, lawyer)
+        # Email channel: deferred to the lawyer's digest, never one-per-movement
+        # (see tests/services/test_movement_digest.py)
+        mock_email.assert_not_called()
 
         # Webhook channel
         mock_wh.assert_called_once()
