@@ -7,7 +7,7 @@ that today are only visible per-case.
 """
 
 import pytest
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 from app.core.security import create_access_token
 from app.main import app
@@ -15,6 +15,7 @@ from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.services.deadline_engine import _today_chile
 from app.services.lawyer_roster import firm_risk_board
 
 ACCOUNT_RUT = "16021492-9"
@@ -176,7 +177,7 @@ class TestFirmRiskBoardRiesgo:
         assert result["riesgo"]["en_apremio"] == 1
 
     def test_plazo_fatal_proximo_vs_vencido_split(self, db, firm_account, court):
-        today = date.today()
+        today = _today_chile()
         proximo = _make_case(
             db, firm_account, court, "C-9109-2025",
             next_deadline_fatal=True, next_deadline_at=today + timedelta(days=3),
@@ -262,7 +263,7 @@ class TestFirmRiskBoardByLawyer:
 
 class TestFirmRiskBoardTopCritical:
     def test_rojo_ranks_before_non_rojo(self, db, firm_account, court):
-        today = date.today()
+        today = _today_chile()
         rojo_case = _make_case(
             db, firm_account, court, "C-9301-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=10),
@@ -278,7 +279,7 @@ class TestFirmRiskBoardTopCritical:
         assert rols.index("C-9301-2025") < rols.index("C-9302-2025")
 
     def test_soonest_deadline_ranks_first_within_same_semaforo(self, db, firm_account, court):
-        today = date.today()
+        today = _today_chile()
         soon = _make_case(
             db, firm_account, court, "C-9303-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=1),
@@ -294,7 +295,7 @@ class TestFirmRiskBoardTopCritical:
         assert rols.index("C-9303-2025") < rols.index("C-9304-2025")
 
     def test_fatal_ranks_before_non_fatal_on_tie(self, db, firm_account, court):
-        today = date.today()
+        today = _today_chile()
         same_date = today + timedelta(days=5)
         fatal = _make_case(
             db, firm_account, court, "C-9305-2025", semaforo="rojo",
@@ -313,7 +314,7 @@ class TestFirmRiskBoardTopCritical:
     def test_null_next_deadline_at_does_not_crash_and_ranks_last(self, db, firm_account, court):
         with_deadline = _make_case(
             db, firm_account, court, "C-9307-2025", semaforo="rojo",
-            next_deadline_at=date.today() + timedelta(days=2),
+            next_deadline_at=_today_chile() + timedelta(days=2),
         )
         without_deadline = _make_case(
             db, firm_account, court, "C-9308-2025", semaforo="rojo",
@@ -329,7 +330,7 @@ class TestFirmRiskBoardTopCritical:
         # Regression for the "arqueología" bug: a deadline that is still
         # actionable (due tomorrow) must outrank one that lapsed years ago —
         # nothing can be done about 2022 anymore, but tomorrow can still be met.
-        today = date.today()
+        today = _today_chile()
         upcoming = _make_case(
             db, firm_account, court, "C-9309-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=1),
@@ -349,7 +350,7 @@ class TestFirmRiskBoardTopCritical:
         # distance-based one agree, so this is the case most likely to be
         # dropped when someone reworks the ranking. It is still part of the
         # contract: the deadline you have to meet first is shown first.
-        today = date.today()
+        today = _today_chile()
         sooner = _make_case(
             db, firm_account, court, "C-9317-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=2),
@@ -367,7 +368,7 @@ class TestFirmRiskBoardTopCritical:
     def test_more_recently_overdue_ranks_before_older_overdue(self, db, firm_account, court):
         # Among already-lapsed deadlines, the one that broke most recently is
         # still plausibly remediable; something from years ago is not.
-        today = date.today()
+        today = _today_chile()
         recently_overdue = _make_case(
             db, firm_account, court, "C-9311-2025", semaforo="rojo",
             next_deadline_at=today - timedelta(days=5),
@@ -385,7 +386,7 @@ class TestFirmRiskBoardTopCritical:
     def test_all_upcoming_rank_before_any_overdue_same_semaforo(self, db, firm_account, court):
         # Even the furthest-out upcoming deadline outranks the most recently
         # lapsed one: a still-open deadline is always more actionable.
-        today = date.today()
+        today = _today_chile()
         far_upcoming = _make_case(
             db, firm_account, court, "C-9313-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=90),
@@ -403,7 +404,7 @@ class TestFirmRiskBoardTopCritical:
     def test_rojo_still_outranks_non_rojo_with_closer_deadline(self, db, firm_account, court):
         # semaforo stays the primary ranking signal even under the new
         # distance-based ordering: it is the study's own urgency flag.
-        today = date.today()
+        today = _today_chile()
         rojo_far = _make_case(
             db, firm_account, court, "C-9315-2025", semaforo="rojo",
             next_deadline_at=today + timedelta(days=200),
@@ -422,7 +423,7 @@ class TestFirmRiskBoardTopCritical:
         for i in range(20):
             c = _make_case(
                 db, firm_account, court, f"C-94{i:02d}-2025", semaforo="rojo",
-                next_deadline_at=date.today() + timedelta(days=i),
+                next_deadline_at=_today_chile() + timedelta(days=i),
             )
             _seed_abogado(db, c, LAWYER_A_RUT, "Lawyer A")
         result = firm_risk_board(db, ACCOUNT_RUT)
@@ -431,7 +432,7 @@ class TestFirmRiskBoardTopCritical:
     def test_top_critical_shape(self, db, firm_account, court):
         c = _make_case(
             db, firm_account, court, "C-9401-2025", semaforo="rojo",
-            next_deadline_at=date.today() + timedelta(days=2),
+            next_deadline_at=_today_chile() + timedelta(days=2),
             next_deadline_fatal=True,
             plaintiff="Banco X", defendant="Juan Pérez",
         )
@@ -565,7 +566,7 @@ class TestRiskBoardEndpoint:
         c = _make_case(
             db, auditor, court, "C-9603-2025", semaforo="rojo",
             abandono_disponible=True, next_deadline_fatal=True,
-            next_deadline_at=date.today() + timedelta(days=1),
+            next_deadline_at=_today_chile() + timedelta(days=1),
         )
         _seed_abogado(db, c, LAWYER_A_RUT, "Lawyer A")
         resp = client.get("/api/v1/stats/risk-board", headers=auditor_headers)
