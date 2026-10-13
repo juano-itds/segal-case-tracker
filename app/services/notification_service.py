@@ -113,6 +113,23 @@ class NotificationService:
                 # covers exactly that.
                 self._drop_smtp()
                 self._smtp_connection().send_message(msg)
+            except smtplib.SMTPResponseException as exc:
+                # 421 is the same event as above, only announced instead of
+                # silent: RFC 5321 defines it as "service not available,
+                # closing the transmission channel". Seen in production as
+                # (421, b'4.4.2 ... Error: timeout exceeded'), which cost a
+                # whole lawyer's digest -- and a digest is never resent, so
+                # that lawyer simply never heard about those movements.
+                #
+                # Every OTHER code is a protocol answer about THIS message (a
+                # refused sender or recipient). Reconnecting on those would pay
+                # a handshake to be refused again and tear down the connection
+                # the rest of the batch is still using. Hence the exact code,
+                # never the whole exception class.
+                if exc.smtp_code != 421:
+                    raise
+                self._drop_smtp()
+                self._smtp_connection().send_message(msg)
 
     def send_email_alert(self, alert: Alert, lawyer: Lawyer) -> bool:
         """

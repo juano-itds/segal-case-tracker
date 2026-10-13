@@ -594,6 +594,47 @@ class TestSmtpConnectionIsReused:
         assert second is True
         assert MockSMTP.call_count == 1, "a recipient error should not reconnect"
 
+    def test_a_421_from_the_provider_is_retried_on_a_fresh_connection(self, service):
+        """421 is the provider SAYING it closes the channel (RFC 5321: service
+        not available). We already reconnect when it closes silently; closing
+        politely must not cost an email either. Seen in production:
+        (421, b'4.4.2 fast.smtpok.com Error: timeout exceeded') lost a whole
+        lawyer's digest, and nothing ever resends a digest."""
+        import smtplib as real_smtplib
+
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                dead, fresh = MagicMock(), MagicMock()
+                dead.send_message.side_effect = real_smtplib.SMTPSenderRefused(
+                    421, b"4.4.2 Error: timeout exceeded", "notificaciones@segal.cl"
+                )
+                MockSMTP.side_effect = [dead, fresh]
+
+                assert service.send_email_alert(_make_alert(), _make_lawyer()) is True
+
+        assert MockSMTP.call_count == 2, "a 421 did not reconnect"
+        fresh.send_message.assert_called_once()
+
+    def test_a_550_sender_rejection_is_not_retried(self, service):
+        """Only 421 is a closing channel. Any other response code is a protocol
+        answer about THIS message: retrying it on a fresh connection would just
+        pay the handshake to be refused again, and would tear down the
+        connection the rest of the batch is still using."""
+        import smtplib as real_smtplib
+
+        with patch("app.services.notification_service.settings") as mock_settings:
+            _smtp_settings(mock_settings)
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                server = MockSMTP.return_value
+                server.send_message.side_effect = real_smtplib.SMTPSenderRefused(
+                    550, b"sender rejected", "notificaciones@segal.cl"
+                )
+
+                assert service.send_email_alert(_make_alert(), _make_lawyer()) is False
+
+        assert MockSMTP.call_count == 1, "a 550 should not reconnect"
+
     def test_close_releases_the_connection(self, service):
         with patch("app.services.notification_service.settings") as mock_settings:
             _smtp_settings(mock_settings)
