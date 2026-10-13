@@ -193,6 +193,21 @@ def _firm_side(db: Session, case: "Case") -> str:
         return "demandado"
 
 
+@dataclass
+class LoadedMovements:
+    """Out-parameter for ``DeadlineEngine.recompute_case``.
+
+    The engine already loads ALL of a case's movements to classify them. A
+    caller that needs the same rows right after (the matriz classification in
+    the sync pipeline) passes one of these and reads ``movements`` back instead
+    of paying a second round-trip. ``movements`` stays ``None`` when the engine
+    did not get as far as loading them (non-civil case, early failure) - the
+    caller must then query for itself.
+    """
+
+    movements: "Optional[list[Movement]]" = None
+
+
 @dataclass(frozen=True)
 class SemaforoTransition:
     """Before/after snapshot of a single ``recompute_case`` call.
@@ -226,7 +241,13 @@ class DeadlineEngine:
     """Stateless engine — all state lives in the DB row and is recomputed on sync."""
 
     @classmethod
-    def recompute_case(cls, db: Session, case: Case) -> SemaforoTransition:
+    def recompute_case(
+        cls,
+        db: Session,
+        case: Case,
+        *,
+        loaded: Optional[LoadedMovements] = None,
+    ) -> SemaforoTransition:
         """Recompute procedural deadlines for *case* and flush to DB.
 
         Flush-only: the outer caller is responsible for commit/rollback.
@@ -236,6 +257,8 @@ class DeadlineEngine:
         Args:
             db:   Active SQLAlchemy session (shared with the sync transaction).
             case: Case ORM instance to update (modified in-place + flushed).
+            loaded: Optional out-parameter; receives the case's movements as
+                    loaded by the engine (see ``LoadedMovements``).
 
         Returns:
             ``SemaforoTransition`` snapshotting ``case.semaforo`` and
@@ -258,7 +281,7 @@ class DeadlineEngine:
             cls._compute_apremio_substage(db, case) if case.en_apremio else None
         )
         try:
-            cls._recompute_safe(db, case)
+            cls._recompute_safe(db, case, loaded=loaded)
         except Exception as exc:
             logger.exception(
                 "DeadlineEngine.recompute_case failed for case_id=%s: %s — "
@@ -280,7 +303,9 @@ class DeadlineEngine:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _recompute_safe(cls, db: Session, case: Case) -> None:
+    def _recompute_safe(
+        cls, db: Session, case: Case, loaded: Optional[LoadedMovements] = None
+    ) -> None:
         today = _today_chile()
 
         # Step 2: competencia guard.
@@ -296,6 +321,8 @@ class DeadlineEngine:
             .order_by(Movement.movement_date.asc())
             .all()
         )
+        if loaded is not None:
+            loaded.movements = movements
 
         # Step 3: classify.
         proc_state, triggers = _CLASSIFIER.classify(movements, today)
@@ -303,6 +330,8 @@ class DeadlineEngine:
         # Determine the firm's side for this case and derive per-case deadline sets.
         side = _firm_side(db, case)
         mandatory_values, actionable_values = actionable_sets(side)
+        # `side` is resolved ONCE per recompute and handed to the decision step
+        # below (it used to query the litigantes a second time).
 
         # Step 4: upsert case_deadlines for each active trigger.
         new_trigger_keys: dict[str, date] = {}  # deadline_type → triggered_at
@@ -547,7 +576,7 @@ class DeadlineEngine:
         # flushed successfully by this point, so a bug in the (newer,
         # less battle-tested) DecisionEngine must never break the deadline
         # computation that already succeeded.
-        cls._recompute_decision(db, case, today)
+        cls._recompute_decision(db, case, today, side=side)
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:
@@ -678,7 +707,9 @@ class DeadlineEngine:
             )
 
     @classmethod
-    def _recompute_decision(cls, db: Session, case: Case, today: date) -> None:
+    def _recompute_decision(
+        cls, db: Session, case: Case, today: date, side: Optional[str] = None
+    ) -> None:
         """Populate recommended_action_code + next_review_at. NEVER raises.
 
         Independent safe-fail: any DecisionEngine error clears both columns
@@ -696,7 +727,9 @@ class DeadlineEngine:
             # cannot tell, so only CONFIRMED plaintiff-side cases are suppressed.
             # `next_review_at` still stands: a prescripción running against our own
             # client is exactly what the plaintiff's lawyer needs to see.
-            if _firm_side(db, case) == "demandante":
+            if side is None:
+                side = _firm_side(db, case)
+            if side == "demandante":
                 case.recommended_action_code = None
             else:
                 recommendation = DecisionEngine.recommend(case, today=today)
