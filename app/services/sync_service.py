@@ -109,6 +109,7 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.document import Document
 from app.services.cycle_timing import format_duration, timed
+from app.services.listing_fingerprint import compute_listing_fingerprint, truncate_raw
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import (
@@ -1238,6 +1239,7 @@ class SyncService:
             existing.competencia = competencia
             if filed_at:
                 existing.filed_at = filed_at
+            self._observe_listing_fingerprint(existing, scraped)
             existing.updated_at = datetime.utcnow()
             return existing, False
         else:
@@ -1255,6 +1257,7 @@ class SyncService:
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )
+            self._observe_listing_fingerprint(case, scraped)
             self.db.add(case)
             self.db.flush()  # Get the ID
             # Make the just-created case visible to later scraped entries in
@@ -1262,6 +1265,41 @@ class SyncService:
             existing_by_rol[normalized_rol] = case
             return case, True
     
+    def _observe_listing_fingerprint(self, case: Case, scraped: ScrapedCase) -> None:
+        """Record the listing-row fingerprint (experiment; observation only).
+
+        Never raises and never alters what the sync does: any failure is
+        logged and swallowed. Writes the listing_* columns ONLY when the
+        fingerprint differs from the stored one. A case with no stored
+        fingerprint is baselined silently (that is not a "change").
+        """
+        try:
+            new_fp = compute_listing_fingerprint(scraped)
+            old_fp = case.listing_fingerprint
+            if new_fp == old_fp:
+                return
+            old_estado, old_cuaderno = case.listing_estado_raw, case.listing_cuaderno_raw
+            case.listing_fingerprint = new_fp
+            case.listing_fingerprint_at = datetime.utcnow()
+            case.listing_estado_raw = truncate_raw(scraped.estado_cuaderno)
+            case.listing_cuaderno_raw = truncate_raw(scraped.cuaderno)
+            if old_fp is not None:
+                logger.info(
+                    "listing fingerprint changed case_id=%s rol=%s "
+                    "estado_cuaderno: %r -> %r; cuaderno: %r -> %r; "
+                    "other cells now: tribunal=%r caratulado=%r fecha=%r institucion=%r",
+                    case.id, scraped.rol,
+                    old_estado, scraped.estado_cuaderno,
+                    old_cuaderno, scraped.cuaderno,
+                    scraped.tribunal, scraped.caratulado,
+                    scraped.fecha_ingreso, scraped.institucion,
+                )
+        except Exception:
+            logger.warning(
+                "listing fingerprint failed for rol=%s; sync continues",
+                getattr(scraped, "rol", "?"), exc_info=True,
+            )
+
     def _upsert_movement(
         self,
         case_id: int,
