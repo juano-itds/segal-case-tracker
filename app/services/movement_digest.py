@@ -13,13 +13,19 @@ No I/O here -- sending and the ``Alert.email_sent`` bookkeeping live in
 
 import html
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, List, Set, Tuple
 
 from app.services.daily_agenda import _BRAND, _section_html
 
 # A single movement description can be a full court resolution; cap what the
 # email carries. The complete text stays in the app (the alert is persisted).
 MAX_DESCRIPTION_CHARS = 280
+
+# A digest renders at most this many movements; the rest are only counted (and
+# announced in a closing line). A backfill batch can detect ~2000 movements for
+# one lawyer, which is not an email anyone reads. It is also the memory bound:
+# the accumulator never keeps more entries than will be rendered.
+MAX_DIGEST_ENTRIES = 150
 
 
 @dataclass
@@ -39,6 +45,27 @@ class DigestEntry:
     date_str: str
     procedure: str
     description: str
+
+
+class DigestBucket:
+    """Bounded accumulator for one lawyer's digest.
+
+    Keeps the first ``MAX_DIGEST_ENTRIES`` entries (the ones that will be
+    rendered, and the only alerts later marked ``email_sent``) plus the true
+    totals: a movement counter and the set of causa ids seen. Memory is
+    O(MAX_DIGEST_ENTRIES + causas), never O(movements).
+    """
+
+    def __init__(self) -> None:
+        self.entries: List[DigestEntry] = []
+        self.total_movements: int = 0
+        self.case_ids: Set[Any] = set()
+
+    def add(self, entry: DigestEntry) -> None:
+        self.total_movements += 1
+        self.case_ids.add(entry.case_id)
+        if len(self.entries) < MAX_DIGEST_ENTRIES:
+            self.entries.append(entry)
 
 
 def _plural(n: int, singular: str, plural: str) -> str:
@@ -98,15 +125,33 @@ def _case_title(first: DigestEntry, count: int) -> str:
     return f"{rol}{caratulado}{court} — {count}"
 
 
-def render_movement_digest(lawyer: Any, entries: List[DigestEntry]) -> Tuple[str, str, str]:
+def _omitted_line(omitted_movements: int, omitted_causas: int) -> str:
+    """Closing line naming what the body left out (both numbers)."""
+    movements = (
+        f"{omitted_movements} {_plural(omitted_movements, 'movimiento', 'movimientos')} más"
+    )
+    if omitted_causas > 0:
+        where = f"en {omitted_causas} {_plural(omitted_causas, 'causa', 'causas')}"
+    else:
+        where = "en causas ya listadas"
+    return f"y {movements} {where} — míralos en la app"
+
+
+def render_movement_digest(lawyer: Any, bucket: DigestBucket) -> Tuple[str, str, str]:
     """Render ``(subject, html_body, text_body)`` for one lawyer's digest.
 
-    Pure function. The caller guarantees ``entries`` is non-empty (an empty
-    digest is never sent).
+    Pure function. The caller guarantees the bucket is non-empty (an empty
+    digest is never sent). The subject and greeting carry the TRUE totals; the
+    body renders ``bucket.entries`` and, when the bucket dropped some, closes
+    with a line saying how many movements and causas were left out.
     """
+    entries = bucket.entries
     groups = group_by_case(entries)
-    movements = len(entries)
-    causas = len(groups)
+    movements = bucket.total_movements
+    causas = len(bucket.case_ids)
+    omitted_movements = movements - len(entries)
+    omitted_causas = causas - len(groups)
+    omitted = _omitted_line(omitted_movements, omitted_causas) if omitted_movements > 0 else ""
     subject = digest_subject(movements, causas)
 
     raw_name = getattr(lawyer, "name", None) or "Abogado(a)"
@@ -120,6 +165,18 @@ def render_movement_digest(lawyer: Any, entries: List[DigestEntry]) -> Tuple[str
     for first, items in groups:
         rows = "\n".join(_movement_row_html(e) for e in items)
         sections_html += _section_html(html.escape(_case_title(first, len(items))), rows)
+
+    omitted_html = (
+        f"""
+          <tr>
+            <td style="padding:8px 32px 0 32px;">
+              <p style="margin:0; color:#374151; font-size:14px; font-weight:bold;">{html.escape(omitted)}</p>
+            </td>
+          </tr>
+"""
+        if omitted
+        else ""
+    )
 
     html_body = f"""\
 <!DOCTYPE html>
@@ -147,7 +204,7 @@ def render_movement_digest(lawyer: Any, entries: List[DigestEntry]) -> Tuple[str
           </tr>
 
 {sections_html}
-
+{omitted_html}
           <tr>
             <td style="padding:24px 32px 32px 32px;">
               <hr style="border:none; border-top:1px solid #e5e7eb; margin:16px 0 16px 0;">
@@ -173,6 +230,9 @@ def render_movement_digest(lawyer: Any, entries: List[DigestEntry]) -> Tuple[str
             date = f" ({e.date_str})" if e.date_str else ""
             desc = f": {_truncate(e.description)}" if e.description else ""
             lines.append(f"  - {e.procedure or 'Movimiento'}{date}{desc}")
+        lines.append("")
+    if omitted:
+        lines.append(omitted)
         lines.append("")
     lines.append(
         "Los plazos y cambios que requieren acción te llegan por separado, en el momento."
