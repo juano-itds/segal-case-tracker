@@ -27,6 +27,21 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 
+# The station must run what is on main: everything else has been merged and
+# deployed, and a leftover feature branch silently runs code that is NOT in
+# production. This happened twice in two days -- once the listing-fingerprint
+# experiment collected nothing for hours because the checkout predated its
+# merge, and the DB columns were there while the code that fills them was not.
+#
+# This only WARNS. It never runs git and never refuses to start: a station that
+# will not come up is worse than one running slightly old code, and the whole
+# point is that nobody is watching when the LaunchAgent fires at boot.
+_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+if [ "$_branch" != "main" ]; then
+  echo "run-worker: ATENCION — la estacion va a correr desde la rama '$_branch', no desde main."
+  echo "run-worker: el codigo mergeado que no este en esa rama NO va a estar corriendo."
+fi
+
 set -a; source .env.qa; set +a
 export DATABASE_URL="$(python3 -c "import os,re;u=os.environ['DATABASE_URL'];u=re.sub(r'@[^/?]+','@127.0.0.1:5433',u,1);u=re.sub(r'[?&]sslmode=[^&]*','',u);print(u+'?sslmode=disable')")"
 export REDIS_URL="redis://localhost:6379/0"
