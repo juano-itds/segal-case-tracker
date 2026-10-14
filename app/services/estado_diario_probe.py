@@ -52,7 +52,17 @@ BOUNCED = "bounced"
 SKIPPED = "skipped"
 PROBE_ERROR = "probe_error"
 
+from app.scrapper.pjud.base import PJUD_BASE_URL
+
 ENDPOINT = "/miEstadoDiario/civil/estadoDiarioFechaCivil.php"
+# The AJAX has to be issued from its own page, the way the listing's is: that
+# one works because it runs on the loaded Mis Causas panel. The 2026-07
+# capture of this endpoint recorded this loader as part of the flow. POSTing
+# cold from whatever page the detail phase left behind risks a rejection we
+# would read as "the endpoint is dead" -- and this feed was already written
+# off once by mistake, for three months. Navigating costs nothing here: the
+# browser is torn down between lawyers anyway.
+LOADER = "/miEstadoDiario.php"
 _BOUNCE_STATUSES = (401, 403)
 
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
@@ -166,7 +176,9 @@ def staleness_stats(
 
 
 async def fetch_estado_diario(page, fecha: str) -> dict:
-    """ONE in-page ``$.ajax`` POST (same shape as the listing's). Never navigates."""
+    """Load the estado-diario page, then ONE in-page ``$.ajax`` POST from it
+    (the same shape the listing uses)."""
+    await page.goto(f"{PJUD_BASE_URL}{LOADER}", wait_until="domcontentloaded")
     js = f"""
         () => new Promise((resolve) => {{
             $.ajax({{

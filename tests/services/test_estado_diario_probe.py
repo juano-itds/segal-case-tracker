@@ -81,6 +81,7 @@ def _logged(mock_logger) -> list[str]:
 def _page(response):
     page = MagicMock()
     page.is_closed.return_value = False
+    page.goto = AsyncMock()
     if isinstance(response, Exception):
         page.evaluate = AsyncMock(side_effect=response)
     else:
@@ -269,6 +270,30 @@ class TestSingleRequest:
         assert "13/10/2026" in js  # Wednesday 14/10 -> Tuesday 13/10
         assert "POST" in js
         assert limiter.acquired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_loader_page_is_visited_before_the_post(
+        self, monkeypatch, limiter, db, log
+    ):
+        """The AJAX must be issued from its own page, like the listing is.
+
+        The listing's `$.ajax` works because it runs on the loaded Mis Causas
+        panel. Whoever captured this endpoint in 2026-07 recorded
+        `GET /miEstadoDiario.php` as its page loader. POSTing cold from
+        whatever page the detail phase happened to leave behind risks a
+        rejection we would read as "the endpoint is dead" — and this feed has
+        already been written off once by mistake. Navigating is free here: the
+        browser is torn down between lawyers anyway.
+        """
+        _enable(monkeypatch)
+        page = _page(_resp(_table([])))
+        await _run(_scraper(page), db)
+
+        page.goto.assert_awaited_once()
+        assert probe.LOADER in page.goto.await_args.args[0]
+        # and the loader came FIRST, before the POST
+        order = [c[0] for c in page.mock_calls if c[0] in ("goto", "evaluate")]
+        assert order[:2] == ["goto", "evaluate"], f"orden real: {order}"
 
     @pytest.mark.asyncio
     async def test_on_a_monday_the_request_asks_for_the_friday(
