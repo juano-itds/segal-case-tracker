@@ -51,6 +51,7 @@ from app.services.cycle_timing import (
     timed,
     use_timer,
 )
+from app.services.estado_diario_probe import run_estado_diario_probe
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
 from app.services.supervisor_alert_service import send_supervisor_credential_alert
@@ -734,6 +735,19 @@ async def sync_lawyer_cases(
                     last_sync_history.status = "partial"  # type: ignore[assignment]
                     last_sync_history.error_message = stop_reason[:1024]  # type: ignore[assignment]
                 db.commit()
+
+        # Observe-only probe of the OJV estado-diario feed. It runs AFTER the
+        # detail phase and the history update, so it cannot change what was
+        # listed, which causas were visited, their order, or any alert; it is
+        # skipped when the batch was cut short (a flagged IP is not poked
+        # further); and nothing it does may break the cycle.
+        if settings.ESTADO_DIARIO_PROBE_ENABLED and not stop_reason:
+            try:
+                await run_estado_diario_probe(
+                    scraper=scraper, lawyer_id=lawyer_id, competencia=competencia
+                )
+            except Exception:  # noqa: BLE001 — a probe failure never breaks the cycle
+                logger.exception("estado-diario probe failed (non-fatal)")
 
         logger.info(
             "Synced %s for lawyer %d: %d cases, %d new, %d new movements",

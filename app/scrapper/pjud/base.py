@@ -1585,6 +1585,18 @@ class PJUDBaseScraper(ABC):
             url=url, reason=f"modal de detalle incompleto ({size} caracteres)"
         )
 
+    def live_page(self) -> Optional[Page]:
+        """Return the page the cycle already holds, or None. Never creates one.
+
+        For observers (e.g. the estado-diario probe) that must reuse the
+        authenticated page and must NOT trigger ``_get_page`` — which can close
+        the context and open a new one, i.e. a second browser session.
+        """
+        page = self._page
+        if page is not None and not page.is_closed():
+            return page
+        return None
+
     async def _page_for(self, session: Optional["PJUDSession"]) -> Page:
         """Reuse the live page only if it was built for *this* session.
 

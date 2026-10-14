@@ -227,6 +227,11 @@ class Settings(BaseSettings):
     # Detail rotation (sync-rotacion Slice 1)
     DETAIL_BATCH_SIZE: int = 30    # Cases per scheduled rotation batch
     DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
+    # Observe-only probe of the OJV "estado diario" feed (see
+    # app/services/estado_diario_probe.py). One in-page POST per lawyer per
+    # cycle, one log line, no effect on what the sync scrapes or alerts.
+    # OFF by default: flip it in the environment to kill it without a deploy.
+    ESTADO_DIARIO_PROBE_ENABLED: bool = False
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
