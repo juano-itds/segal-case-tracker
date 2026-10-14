@@ -45,11 +45,29 @@ absorbs weekends and holidays without depending on the holiday table. 5 days
 covers 92% of the observed cases. Do not remove this: without it the verdict
 states a business fact the data cannot support.
 
+acreditar_poder_3d: two biases stack, both toward a false ``fuera_de_plazo``
+------------------------------------------------------------------------------
+(1) the same publication lag as above; (2) our due_date counts from the
+resolution's own ``movement_date`` whereas the firm's spec runs the 3 days from
+the NOTIFICATION of that resolution, which is later. The margin for this type is
+therefore ``DEADLINE_PUBLICATION_MARGIN_DAYS + DEADLINE_PODER_NOTIFICATION_
+ALLOWANCE_DAYS``. The first term was measured on other deadlines; the second is
+a judgment, not a measurement (see config). Neither bias can ever produce a
+``cumplido``: that needs the publication date to be <= due_date, and both
+biases only make the data look LATER than reality. Two further rules:
+
+* The act must be dated STRICTLY after the resolution that opened the plazo
+  (``triggered_at``). A demand often says "Acredita Poder" itself, long before
+  the order; counting it would be a false ``cumplido``. No ``triggered_at`` means
+  no verdict.
+* Absence of the act is ``no_cumplido`` only once the margin has also elapsed:
+  an escrito filed on time may simply not be published yet.
+
 DETECTORS is the registry of "how do we recognise the act that fulfils plazo
-X". Only excepciones_8d is implemented. Every other type is deliberately left
-"sin determinar" until its signal is defined: an invented verdict is worse than
-none, because it reads as a business fact ("the firm missed it") that nobody
-checked.
+X". Only excepciones_8d and acreditar_poder_3d are implemented. Every other type
+is deliberately left "sin determinar" until its signal is defined: an invented
+verdict is worse than none, because it reads as a business fact ("the firm
+missed it") that nobody checked.
 """
 
 from __future__ import annotations
@@ -62,6 +80,7 @@ from typing import Callable, Optional, Sequence
 
 from app.config import settings
 from app.core.deadlines_config import DeadlineType
+from app.services.poder_deadline import is_compliance_movement
 
 
 class Verdict(str, Enum):
@@ -113,18 +132,54 @@ def is_excepciones_filing(movement: object) -> bool:
 
 
 # A detector returns the movement that fulfils the plazo (the earliest valid
-# one — if any filing is on time, the plazo was met), or None.
-Detector = Callable[[Sequence[object]], Optional[object]]
+# one — if any filing is on time, the plazo was met), or None. ``triggered_at``
+# is the date of the movement that opened the plazo, for detectors whose act is
+# defined relative to it.
+Detector = Callable[..., Optional[object]]
 
 
-def _detect_excepciones(movements: Sequence[object]) -> Optional[object]:
+def _detect_excepciones(
+    movements: Sequence[object], triggered_at: Optional[date] = None
+) -> Optional[object]:
     filings = [m for m in movements if is_excepciones_filing(m)]
     return min(filings, key=_day) if filings else None
 
 
+def _detect_poder(
+    movements: Sequence[object], triggered_at: Optional[date] = None
+) -> Optional[object]:
+    """Earliest compliance movement dated STRICTLY after the resolution.
+
+    Same wording and same strictness as ``find_poder_obligation`` (which sets the
+    row's ``status``), so the verdict can only be stricter on timing, never
+    contradict it on whether the act exists.
+    """
+    if triggered_at is None:
+        return None
+    acts = [m for m in movements if is_compliance_movement(m) and _day(m) > triggered_at]
+    return min(acts, key=_day) if acts else None
+
+
 DETECTORS: dict[str, Detector] = {
     DeadlineType.EXCEPCIONES_8D.value: _detect_excepciones,
+    DeadlineType.ACREDITAR_PODER_3D.value: _detect_poder,
 }
+
+# Detectors that cannot answer without ``triggered_at``: with no anchor the
+# honest result is "sin determinar", not "no act found".
+_NEEDS_TRIGGER = frozenset({DeadlineType.ACREDITAR_PODER_3D.value})
+
+# Types where "no act yet" must also wait out the margin before it is called
+# no_cumplido (the act may be filed on time but not yet published).
+_ABSENCE_WAITS_FOR_MARGIN = frozenset({DeadlineType.ACREDITAR_PODER_3D.value})
+
+
+def default_margin_days(deadline_type: str) -> int:
+    """Calendar days of tolerance for ``deadline_type`` (see module docstring)."""
+    margin = settings.DEADLINE_PUBLICATION_MARGIN_DAYS
+    if deadline_type == DeadlineType.ACREDITAR_PODER_3D.value:
+        margin += max(settings.DEADLINE_PODER_NOTIFICATION_ALLOWANCE_DAYS, 0)
+    return margin
 
 
 def evaluate_deadline(
@@ -134,19 +189,31 @@ def evaluate_deadline(
     today: date,
     *,
     publication_margin_days: Optional[int] = None,
+    triggered_at: Optional[date] = None,
 ) -> VerdictResult:
     """Pure evaluation. Never reads the row's lifecycle ``status``.
 
-    ``publication_margin_days`` defaults to the setting; 0 disables the margin.
+    ``publication_margin_days`` defaults to the per-type setting; 0 disables it.
     """
     detector = DETECTORS.get(deadline_type)
     if detector is None:
         return UNDETERMINED
+    if deadline_type in _NEEDS_TRIGGER and triggered_at is None:
+        return UNDETERMINED
 
-    act = detector(movements)
+    if publication_margin_days is None:
+        publication_margin_days = default_margin_days(deadline_type)
+    margin = timedelta(days=max(publication_margin_days, 0))
+
+    act = detector(movements, triggered_at=triggered_at)
     if act is None:
         # Absence only proves a miss once the window has actually elapsed.
-        if due_date is not None and due_date < today:
+        if due_date is None:
+            return UNDETERMINED
+        deadline_end = due_date + (
+            margin if deadline_type in _ABSENCE_WAITS_FOR_MARGIN else timedelta(0)
+        )
+        if deadline_end < today:
             return VerdictResult(Verdict.NO_CUMPLIDO)
         return UNDETERMINED
 
@@ -154,11 +221,9 @@ def evaluate_deadline(
     movement_id = getattr(act, "id", None)
     if due_date is None:
         return VerdictResult(Verdict.PRESENTADO_SIN_ANCLA, movement_id, acted_on)
-    if publication_margin_days is None:
-        publication_margin_days = settings.DEADLINE_PUBLICATION_MARGIN_DAYS
     if acted_on <= due_date:
         verdict = Verdict.CUMPLIDO
-    elif acted_on <= due_date + timedelta(days=max(publication_margin_days, 0)):
+    elif acted_on <= due_date + margin:
         verdict = Verdict.REGISTRO_TARDIO
     else:
         verdict = Verdict.FUERA_DE_PLAZO

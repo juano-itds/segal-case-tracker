@@ -75,6 +75,16 @@ class Settings(BaseSettings):
     # Rationale in app/services/deadline_verdict.py.
     DEADLINE_PUBLICATION_MARGIN_DAYS: int = 5
 
+    # Extra calendar days added to the publication margin ONLY for the
+    # acreditar_poder_3d verdict. Our due_date counts from the resolution's own
+    # date; the firm's spec runs the 3 days from its NOTIFICATION, which is later.
+    # NOT MEASURED (the publication margin was measured on a different deadline):
+    # a judgment, deliberately on the safe side, since a wider margin can only turn
+    # a "fuera_de_plazo" into the weaker "registro_tardio", never into "cumplido".
+    # Calibrate with the Diligencia date of the notification of the resolution vs
+    # its movement_date. 0 disables it. Rationale in app/services/deadline_verdict.py.
+    DEADLINE_PODER_NOTIFICATION_ALLOWANCE_DAYS: int = 2
+
     # Email
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"
