@@ -87,6 +87,21 @@ def add_business_days(start: date, n: int) -> date:
     return current
 
 
+def previous_business_day(d: date, *, include_saturday: bool = True) -> date:
+    """Return the closest día hábil strictly before *d*.
+
+    Saturday counts as hábil by default (art. 66 CPC, see ``_is_business_day``).
+    Pass ``include_saturday=False`` for feeds the courts only publish Monday to
+    Friday (e.g. the OJV estado diario): on a Monday that yields the Friday.
+    """
+    current = d - timedelta(days=1)
+    while not _is_business_day(current) or (
+        not include_saturday and current.weekday() == 5
+    ):
+        current -= timedelta(days=1)
+    return current
+
+
 def count_business_days_remaining(due_date: date, today: date) -> int:
     """Count business days between *today* and *due_date*.
 
