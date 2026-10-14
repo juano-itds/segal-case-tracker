@@ -509,6 +509,8 @@ class TestChangeLogCarriesAllSevenCells:
         msg = line.getMessage()
         assert "rows=?->2" in msg
         assert "tribunal=?->" in msg
+        # unknown is not "changed": only cuaderno is known to differ here
+        assert "changed=cuaderno " in msg
         # the two raw columns #339 did store are still used
         assert "estado_cuaderno='Tramitación'->'Tramitación'" in msg
 

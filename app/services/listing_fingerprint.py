@@ -116,7 +116,7 @@ def format_listing_change(old_rows, new_rows, old_estado, old_cuaderno) -> str:
     else:
         old = {name: None for name in LISTING_FINGERPRINT_FIELDS}
         old["estado_cuaderno"], old["cuaderno"] = old_estado, old_cuaderno
-    changed = [n for n in LISTING_FINGERPRINT_FIELDS if old[n] != new[n]]
+    changed = [n for n in LISTING_FINGERPRINT_FIELDS if old[n] is not None and old[n] != new[n]]
     parts = [
         f"rows={'?' if old_rows is None else len(old_rows)}->{len(new_rows)}",
         f"changed={','.join(changed) if changed else 'row-set'}",
