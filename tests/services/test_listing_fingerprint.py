@@ -521,3 +521,47 @@ class TestChangeLogCarriesAllSevenCells:
         msgs = [r.getMessage() for r in _changed_lines(sync_logs)]
         assert "cuaderno='A'->'B'" in msgs[0]
         assert "cuaderno='B'->'C'" in msgs[1]
+
+
+def test_cell_values_render_in_a_stable_order():
+    """Cell values must render in SORTED order, not set-iteration order.
+
+    Without an explicit sort the order comes from set iteration, which depends
+    on the interpreter's hash seed: two runs of the same pass could print the
+    same change differently, and a human comparing two log lines would see a
+    change that is not there.
+
+    Six values are used on purpose. With two, set order happens to match sorted
+    order and the test passes even with the sort removed — that is exactly how
+    the first version of this test failed to catch the mutant.
+    """
+    from app.services.listing_fingerprint import (
+        canonical_listing_rows,
+        per_field_values,
+    )
+
+    cuadernos = [
+        "Principal",
+        "Incidente Abandono del Proc.",
+        "Medida prejudicial",
+        "Cuaderno de Apremio",
+        "Incidente Nulidad",
+        "Tercería",
+    ]
+
+    def _row(cuaderno):
+        return SimpleNamespace(
+            rol="C-1-2025", tribunal="T", caratulado="A/B",
+            fecha_ingreso="01/01/2025", estado_cuaderno="Tramitación",
+            cuaderno=cuaderno, institucion="X",
+        )
+
+    rows = [_row(c) for c in cuadernos]
+    rendered = per_field_values(canonical_listing_rows(rows))["cuaderno"]
+
+    assert rendered.split(" | ") == sorted(cuadernos)
+    # And it does not depend on the order the rows arrived in.
+    assert (
+        per_field_values(canonical_listing_rows(list(reversed(rows))))["cuaderno"]
+        == rendered
+    )
