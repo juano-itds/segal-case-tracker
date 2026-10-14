@@ -263,8 +263,16 @@ class TestSingleRequest:
         _enable(monkeypatch)
         page = _page(_resp(_table([])))
         await _run(_scraper(page), db)
-        assert page.evaluate.await_count == 1
-        js = page.evaluate.await_args.args[0]
+        # Exactly one request to PJUD. Count the calls that actually hit the
+        # endpoint, not every `evaluate`: the jQuery feature check is local JS
+        # and costs no request, so counting evaluates would be a proxy that
+        # breaks every time we add a local check.
+        posts = [
+            c.args[0] for c in page.evaluate.await_args_list
+            if "estadoDiarioFechaCivil.php" in c.args[0]
+        ]
+        assert len(posts) == 1, f"{len(posts)} requests al endpoint"
+        js = posts[0]
         assert "estadoDiarioFechaCivil.php" in js
         assert "fechaEstDiaCiv" in js
         assert "13/10/2026" in js  # Wednesday 14/10 -> Tuesday 13/10
@@ -294,6 +302,31 @@ class TestSingleRequest:
         # and the loader came FIRST, before the POST
         order = [c[0] for c in page.mock_calls if c[0] in ("goto", "evaluate")]
         assert order[:2] == ["goto", "evaluate"], f"orden real: {order}"
+
+    @pytest.mark.asyncio
+    async def test_works_on_a_page_without_jquery(self, monkeypatch, limiter, db, log):
+        """Measured in production 2026-10-14, first real run:
+
+            outcome=probe_error error=Page.evaluate: ReferenceError: $ is not defined
+
+        `/miEstadoDiario.php` does not give us jQuery the way the Mis Causas
+        panel does, so `$.ajax` is not available. The probe must still issue
+        the request — and crucially it must NOT report this as a dead
+        endpoint: that is how this feed gets written off by mistake.
+        """
+        _enable(monkeypatch)
+        page = _page(_resp(_table([])))
+        # jQuery absent: the jQuery probe evaluates falsey, the request still runs.
+        page.evaluate = AsyncMock(side_effect=[False, _resp(_table([]))])
+
+        await _run(_scraper(page), db)
+
+        # it fell back instead of blowing up, and said so honestly
+        lines = _logged(log)
+        assert lines, "el sondeo no logueo nada"
+        joined = " ".join(lines)
+        assert "probe_error" not in joined, joined
+        assert "outcome=no_activity" in joined, joined
 
     @pytest.mark.asyncio
     async def test_on_a_monday_the_request_asks_for_the_friday(
