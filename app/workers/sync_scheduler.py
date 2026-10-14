@@ -665,6 +665,9 @@ async def sync_lawyer_cases(
                 scraped_cases=scraped_cases,
                 competencia=competencia,
                 triggered_by="scheduled",
+                # A cut listing may lack rows of a ROL: the listing fingerprint
+                # (a fingerprint of the SET of rows) must not record from it.
+                listing_complete=listing_incomplete_msg is None,
             )
 
         # Select the rotation batch AFTER the full case-list upsert so the DB

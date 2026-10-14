@@ -70,6 +70,7 @@ class _Harness:
             sync_service_cls.return_value.sync_cases.return_value = MagicMock(
                 cases_total=0, cases_new=0
             )
+            self.sync_cases = sync_service_cls.return_value.sync_cases
             return await sync_lawyer_cases(lawyer_id=1, competencia="civil", db=self.db)
 
 
@@ -234,6 +235,23 @@ class TestPartialListing:
         assert history.status == "partial"
         assert "página 4 de 139" in history.error_message
         assert "lote detenido" in history.error_message
+
+    @pytest.mark.asyncio
+    async def test_partial_listing_tells_sync_cases_the_listing_is_incomplete(self):
+        """The listing fingerprint covers the SET of rows per ROL: a cut listing
+        must not be allowed to record a set that looks complete."""
+        err, _ = self._partial()
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[err], reauth_result=(None, None))
+        await h.run()
+        assert h.sync_cases.call_args.kwargs["listing_complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_full_listing_tells_sync_cases_the_listing_is_complete(self):
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[[]], reauth_result=(None, None))
+        await h.run()
+        assert h.sync_cases.call_args.kwargs["listing_complete"] is True
 
     @pytest.mark.asyncio
     async def test_happy_path_unchanged(self):
