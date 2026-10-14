@@ -161,6 +161,7 @@ def planificar(
                 movements.get(row.case_id, []),
                 today,
                 publication_margin_days=publication_margin_days,
+                triggered_at=row.triggered_at,
             )
             if result.verdict is None:
                 if not protegida:

@@ -452,7 +452,7 @@ class DeadlineEngine:
 
         # Step 5c: parallel plazos (outside the "one state, one set of plazos"
         # model). Runs AFTER steps 5/5b so nothing above can touch these rows.
-        cls._sync_parallel_deadlines(db, movements)
+        cls._sync_parallel_deadlines(db, movements, today)
         db.flush()
 
         # Step 6: REBELDÍA post-transition.
@@ -597,16 +597,39 @@ class DeadlineEngine:
         """
         if row.is_manual or row.status in ("cumplido", "no_cumplido"):
             return
-        result = evaluate_deadline(
-            row.deadline_type, cls._current_due_date(row), movements, today
-        )
-        if result.verdict is None:
+        cls._apply_verdict(row, movements, today)
+
+    @classmethod
+    def _apply_verdict(
+        cls, row: CaseDeadline, movements: list[Movement], today: date
+    ) -> None:
+        """Evaluate and write the verdict columns of ``row``. NEVER raises.
+
+        A verdict is derived data: failing to compute it must never break the
+        sync, so any error is logged and the row is left without a verdict
+        (a stale one would be worse than none). Writes ONLY ``verdict*``.
+        """
+        try:
+            result = evaluate_deadline(
+                row.deadline_type,
+                cls._current_due_date(row),
+                movements,
+                today,
+                triggered_at=row.triggered_at,
+            )
+            if result.verdict is None:
+                cls._clear_verdict(row)
+                return
+            row.verdict = result.verdict.value
+            row.verdict_movement_id = result.movement_id
+            row.verdict_acted_on = result.acted_on
+            row.verdict_computed_at = datetime.now(timezone.utc)
+        except Exception as exc:
+            logger.exception(
+                "verdict failed for case_id=%s deadline_type=%s: %s — skipping",
+                getattr(row, "case_id", "?"), getattr(row, "deadline_type", "?"), exc,
+            )
             cls._clear_verdict(row)
-            return
-        row.verdict = result.verdict.value
-        row.verdict_movement_id = result.movement_id
-        row.verdict_acted_on = result.acted_on
-        row.verdict_computed_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _current_due_date(row: CaseDeadline) -> date:
@@ -627,7 +650,9 @@ class DeadlineEngine:
         return add_business_days(anchor_date(source), dtype.dias_habiles)
 
     @classmethod
-    def _sync_parallel_deadlines(cls, db: Session, movements: list) -> None:
+    def _sync_parallel_deadlines(
+        cls, db: Session, movements: list, today: date
+    ) -> None:
         """Upsert ACREDITAR_PODER_3D from the raw movements. NEVER raises.
 
         Own safe-fail boundary: a bug here must not push the whole case to GRIS
@@ -663,8 +688,9 @@ class DeadlineEngine:
                     )
                     .first()
                 )
+                current_row = existing
                 if existing is None:
-                    db.add(CaseDeadline(
+                    current_row = CaseDeadline(
                         case_id=case_id,
                         deadline_type=dtype.value,
                         legal_basis=dtype.legal_basis,
@@ -673,7 +699,8 @@ class DeadlineEngine:
                         status="cumplido" if obligation.fulfilled else "active",
                         source_movement_id=getattr(obligation.trigger, "id", None),
                         computed_at=datetime.now(timezone.utc),
-                    ))
+                    )
+                    db.add(current_row)
                 elif not existing.is_manual and existing.status == "active":
                     # Only "active" rows are refreshed. Audited (cumplido /
                     # no_cumplido) and manual rows are the auditor's call, and a
@@ -683,6 +710,18 @@ class DeadlineEngine:
                     existing.due_date = due_date
                     existing.status = "cumplido" if obligation.fulfilled else "active"
                     existing.computed_at = datetime.now(timezone.utc)
+
+                # The verdict is separate from ``status`` (which Sysgal reads and
+                # which is written above without comparing dates; it is NOT
+                # touched here). Auditor-marked and manual rows stay theirs. A
+                # status="cumplido" written by the engine itself carries no
+                # marked_by/marked_at, so it is judged too.
+                if (
+                    not current_row.is_manual
+                    and current_row.marked_by is None
+                    and current_row.marked_at is None
+                ):
+                    cls._apply_verdict(current_row, movements, today)
 
             # Any other still-active automatic row is stale (a newer resolution
             # replaced it, or the only one was annulled).
@@ -698,6 +737,9 @@ class DeadlineEngine:
             )
             for row in stale:
                 if current_trigger is None or row.triggered_at != current_trigger:
+                    # Judged against a newer resolution's movements the old row
+                    # could read a false cumplido: leave it without a verdict.
+                    cls._clear_verdict(row)
                     row.status = "superseded"
         except Exception as exc:  # pragma: no cover - defensive boundary
             logger.exception(

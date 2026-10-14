@@ -76,6 +76,17 @@ def _is_court_act(movement: object) -> bool:
     return procedure.strip().lower() != "escrito"
 
 
+def is_compliance_movement(movement: object) -> bool:
+    """A valid (non-``[Nulo]``) movement that fulfils the obligation by wording.
+
+    The single definition of "compliance": the engine's ``fulfilled`` flag and the
+    verdict detector must agree on it, or a row could read ``cumplido`` by one
+    and not by the other. Dating (strictly after the resolution) is the caller's.
+    """
+    description = _description(movement)
+    return bool(_COMPLIANCE_RE.search(description)) and not _NULO_RE.search(description)
+
+
 def find_poder_obligation(movements: list) -> PoderObligation | None:
     """Return the latest valid ``Previo a proveer``, or None when there is none.
 
@@ -96,10 +107,7 @@ def find_poder_obligation(movements: list) -> PoderObligation | None:
     trigger = max(triggers, key=_day)
     trigger_day = _day(trigger)
     fulfilled = any(
-        _COMPLIANCE_RE.search(_description(m))
-        and not _NULO_RE.search(_description(m))
-        and _day(m) > trigger_day
-        for m in movements
+        is_compliance_movement(m) and _day(m) > trigger_day for m in movements
     )
     return PoderObligation(trigger=trigger, fulfilled=fulfilled)
 
