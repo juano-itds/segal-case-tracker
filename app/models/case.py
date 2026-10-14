@@ -147,6 +147,9 @@ class Case(Base):
     listing_fingerprint_at = Column(DateTime, nullable=True)
     listing_estado_raw = Column(String(255), nullable=True)
     listing_cuaderno_raw = Column(String(255), nullable=True)
+    # Canonical JSON of the listing rows behind the fingerprint (migration 067);
+    # only so the next change can log old values of every cell.
+    listing_rows_raw = Column(Text, nullable=True)
     poda_por_rut = Column(String(20), nullable=True)  # RUT de quien ejecutó la poda
 
     # Timestamps

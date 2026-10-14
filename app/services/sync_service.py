@@ -110,7 +110,15 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.document import Document
 from app.services.cycle_timing import format_duration, timed
-from app.services.listing_fingerprint import compute_listing_fingerprint, truncate_raw
+from app.services.listing_fingerprint import (
+    canonical_listing_rows,
+    compute_listing_set_fingerprint,
+    format_listing_change,
+    parse_listing_rows,
+    per_field_values,
+    serialize_listing_rows,
+    truncate_raw,
+)
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import (
@@ -826,6 +834,7 @@ class SyncService:
         competencia: str = "civil",
         year: Optional[str] = None,
         triggered_by: str = "manual",
+        listing_complete: bool = True,
     ) -> SyncResult:
         """
         Sync a list of scraped cases to the database.
@@ -836,6 +845,12 @@ class SyncService:
             competencia: civil, laboral, or penal
             year: Optional year filter
             triggered_by: manual, scheduled, or webhook
+            listing_complete: False when PJUD cut the listing short. The
+                listing fingerprint covers ALL rows of a ROL, so a cut listing
+                could hand it an incomplete set that looks complete and
+                fabricate a "change" on the next pass: when False the
+                fingerprint experiment records nothing. The sync itself is
+                unaffected.
         
         Returns:
             SyncResult with counts of what was synced
@@ -875,6 +890,18 @@ class SyncService:
             c.rol: c
             for c in self.db.query(Case).filter(Case.lawyer_id == lawyer_id).all()
         }
+
+        # Listing-fingerprint seam. _upsert_case runs once per listing ROW but
+        # the fingerprint is about the SET of rows of a ROL, so the grouping is
+        # done HERE, once, over the whole listing and BEFORE the chunk loop:
+        # it cannot depend on chunk boundaries, on retries of a chunk, or on
+        # which row a chunk happens to hold. None = do not observe (partial
+        # listing). See SyncService._observe_listing_fingerprint.
+        listing_rows_by_rol: Optional[dict] = None
+        if listing_complete:
+            listing_rows_by_rol = {}
+            for scraped in scraped_cases:
+                listing_rows_by_rol.setdefault(scraped.rol.strip().upper(), []).append(scraped)
 
         # Chunked commits (resilience): a lawyer with a large caseload (e.g.
         # ~2085 cases) synced over the Mac's Cloud SQL Auth Proxy can hit a
@@ -917,7 +944,8 @@ class SyncService:
                             continue
                         try:
                             case, is_new = self._upsert_case(
-                                lawyer_id, scraped, competencia, existing_by_rol
+                                lawyer_id, scraped, competencia, existing_by_rol,
+                                listing_rows_by_rol=listing_rows_by_rol,
                             )
                             if is_new:
                                 chunk_new += 1
@@ -1204,6 +1232,7 @@ class SyncService:
         scraped: ScrapedCase,
         competencia: str,
         existing_by_rol: dict,
+        listing_rows_by_rol: Optional[dict] = None,
     ) -> Tuple[Case, bool]:
         """
         Insert or update a case.
@@ -1215,6 +1244,8 @@ class SyncService:
                 duplicate ROL later in the same batch resolves to the
                 just-created row (mirrors the old behavior, where the
                 per-case flush let the next per-case query find it).
+            listing_rows_by_rol: {normalized_rol: every listing row of that ROL
+                in this pass} for the listing fingerprint; None skips it.
 
         Returns:
             Tuple of (case, is_new)
@@ -1245,7 +1276,7 @@ class SyncService:
             existing.competencia = competencia
             if filed_at:
                 existing.filed_at = filed_at
-            self._observe_listing_fingerprint(existing, scraped)
+            self._observe_listing_fingerprint(existing, normalized_rol, listing_rows_by_rol)
             existing.updated_at = datetime.utcnow()
             return existing, False
         else:
@@ -1263,7 +1294,7 @@ class SyncService:
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )
-            self._observe_listing_fingerprint(case, scraped)
+            self._observe_listing_fingerprint(case, normalized_rol, listing_rows_by_rol)
             self.db.add(case)
             self.db.flush()  # Get the ID
             # Make the just-created case visible to later scraped entries in
@@ -1271,39 +1302,50 @@ class SyncService:
             existing_by_rol[normalized_rol] = case
             return case, True
     
-    def _observe_listing_fingerprint(self, case: Case, scraped: ScrapedCase) -> None:
-        """Record the listing-row fingerprint (experiment; observation only).
+    def _observe_listing_fingerprint(
+        self, case: Case, normalized_rol: str, listing_rows_by_rol: Optional[dict]
+    ) -> None:
+        """Record the fingerprint of the SET of listing rows (experiment).
 
         Never raises and never alters what the sync does: any failure is
         logged and swallowed. Writes the listing_* columns ONLY when the
         fingerprint differs from the stored one. A case with no stored
-        fingerprint is baselined silently (that is not a "change").
+        fingerprint is baselined silently (that is not a "change"). Runs once
+        per listing row but is idempotent per ROL: the first call stores the
+        set's fingerprint and the following ones see it equal.
         """
+        rows = (listing_rows_by_rol or {}).get(normalized_rol)
+        if not rows:
+            return
         try:
-            new_fp = compute_listing_fingerprint(scraped)
+            new_fp = compute_listing_set_fingerprint(rows)
             old_fp = case.listing_fingerprint
             if new_fp == old_fp:
                 return
+            canonical = canonical_listing_rows(rows)
+            old_rows = parse_listing_rows(case.listing_rows_raw)
             old_estado, old_cuaderno = case.listing_estado_raw, case.listing_cuaderno_raw
+            if len(canonical) == 1:
+                # Exactly what PR #339 stored for a one-row ROL.
+                estado, cuaderno = rows[0].estado_cuaderno, rows[0].cuaderno
+            else:
+                values = per_field_values(canonical)
+                estado, cuaderno = values["estado_cuaderno"], values["cuaderno"]
             case.listing_fingerprint = new_fp
             case.listing_fingerprint_at = datetime.utcnow()
-            case.listing_estado_raw = truncate_raw(scraped.estado_cuaderno)
-            case.listing_cuaderno_raw = truncate_raw(scraped.cuaderno)
+            case.listing_estado_raw = truncate_raw(estado)
+            case.listing_cuaderno_raw = truncate_raw(cuaderno)
+            case.listing_rows_raw = serialize_listing_rows(rows)
             if old_fp is not None:
                 logger.info(
-                    "listing fingerprint changed case_id=%s rol=%s "
-                    "estado_cuaderno: %r -> %r; cuaderno: %r -> %r; "
-                    "other cells now: tribunal=%r caratulado=%r fecha=%r institucion=%r",
-                    case.id, scraped.rol,
-                    old_estado, scraped.estado_cuaderno,
-                    old_cuaderno, scraped.cuaderno,
-                    scraped.tribunal, scraped.caratulado,
-                    scraped.fecha_ingreso, scraped.institucion,
+                    "listing fingerprint changed case_id=%s rol=%s %s",
+                    case.id, normalized_rol,
+                    format_listing_change(old_rows, canonical, old_estado, old_cuaderno),
                 )
         except Exception:
             logger.warning(
                 "listing fingerprint failed for rol=%s; sync continues",
-                getattr(scraped, "rol", "?"), exc_info=True,
+                normalized_rol, exc_info=True,
             )
 
     def _upsert_movement(
