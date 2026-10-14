@@ -385,6 +385,15 @@ class TestSetThroughTheRealUpsert:
         c = _case(db)
         assert (c.listing_estado_raw, c.listing_cuaderno_raw) == a
 
+    def test_single_row_raw_columns_keep_none_as_none(self, db, lawyer):
+        """#339 stored the cell as received; a None cell must stay NULL."""
+        row = _row()
+        row.estado_cuaderno = None
+        _sync(db, lawyer, row)
+        c = _case(db)
+        assert c.listing_estado_raw is None
+        assert c.listing_cuaderno_raw == "Principal"
+
     def test_single_row_behaves_exactly_like_before(self, db, lawyer, sync_logs):
         """Constraint 5, end to end: stored fingerprint, raw columns and the
         change semantics of a one-row ROL are those of #339."""
@@ -409,6 +418,8 @@ class TestPartialPass:
         assert c.listing_fingerprint is None
         assert c.listing_rows_raw is None
         assert _changed_lines(sync_logs) == []
+        # skipping is a deliberate no-op, not a swallowed exception
+        assert [r for r in sync_logs if r.levelno >= logging.WARNING] == []
 
     def test_incomplete_listing_leaves_an_existing_fingerprint_untouched(
         self, db, lawyer, sync_logs
