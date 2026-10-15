@@ -9,11 +9,35 @@ Saber todos los días qué causas se movieron y cuáles no.
 ## Problema
 
 Una vuelta completa a la cartera tarda ~80 días, así que hoy es imposible
-responder "qué se movió hoy". El portal PJUD **no ofrece ninguna señal de
-cambio**: no hay feed, ni estado diario, ni búsqueda por fecha de movimiento.
-El listado de "Mis Causas" solo trae `rol, tribunal, caratulado, fecha_ingreso,
-estado_cuaderno, cuaderno, institucion` — nada que cambie cuando el tribunal
-resuelve algo.
+responder "qué se movió hoy".
+
+El **listado** de "Mis Causas" no ayuda: solo trae `rol, tribunal, caratulado,
+fecha_ingreso, estado_cuaderno, cuaderno, institucion` — nada que cambie cuando
+el tribunal resuelve algo.
+
+> **CORRECCIÓN (2026-10-15).** La versión original de este documento afirmaba
+> que *"el portal PJUD no ofrece ninguna señal de cambio: no hay feed, ni
+> estado diario, ni búsqueda por fecha de movimiento"*. **Es falso**, y el
+> proyecto tenía la evidencia desde el 2026-07-06. La OJV publica un
+> **estado diario** por competencia, consultable por fecha:
+>
+> ```
+> GET  /miEstadoDiario.php                                 ← loader obligatorio
+> POST /miEstadoDiario/civil/estadoDiarioFechaCivil.php    fechaEstDiaCiv=DD/MM/YYYY
+> ```
+>
+> Verificado vivo el 2026-10-15, tres meses después de capturarse. Hacen falta
+> dos cosas no obvias: cargar el loader antes (el AJAX sale de su propia
+> página) y usar `fetch`, porque esa página **no carga jQuery**.
+>
+> El sondeo que corre hoy en producción (flag `ESTADO_DIARIO_PROBE_ENABLED`,
+> solo observa) mide cuántas de esas causas notificadas ya tenemos. Eso cambia
+> la premisa entera de este documento: el barrido a ciegas deja de ser la única
+> salida, porque el feed dice **qué** bajar.
+>
+> La afirmación falsa se repitió como verificada hasta que alguien la cruzó
+> contra el reconocimiento ya capturado. Queda acá a la vista, no borrada, para
+> que el error sea legible.
 
 ## Por qué es alcanzable igual
 
