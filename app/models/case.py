@@ -101,6 +101,10 @@ class Case(Base):
     titulo_tipo = Column(String(30), nullable=True)   # input: pagare|letra|cheque|escritura_publica|sentencia|otro
     titulo_fecha = Column(Date, nullable=True)         # input: title's key date
     prescripcion_cumplida = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # computed
+    # Compliance axis (the semáforo is the pending-action axis): True when the
+    # case has a no_cumplido row of a plazo that is both actionable for the
+    # firm's side and FATAL. Computed by DeadlineEngine; never edited by hand.
+    plazo_fatal_incumplido = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     prescripcion_fecha = Column(Date, nullable=True)   # computed: titulo_fecha + plazo
 
     # Decision engine — populated by DeadlineEngine.recompute_case (via DecisionEngine)

@@ -40,6 +40,7 @@ def _report(result) -> None:
         print(
             f"  case {o.case_id:<7} {o.rol or '-':<16} due {o.due_date}  "
             f"{o.old_status} -> {o.new_status}   semaforo {o.old_semaforo} -> {o.new_semaforo}"
+            f"   fatal_flag {o.old_fatal_flag} -> {o.new_fatal_flag}"
             f"\n      rows after: {o.rows_after}"
         )
 
@@ -49,6 +50,7 @@ def _report(result) -> None:
     print(f"  closed some other way (superseded): {result.other}")
     print(f"  unchanged (still active):           {result.unchanged}")
     print(f"  red semaforo cleared:               {result.rojo_cleared}")
+    print(f"  newly flagged plazo_fatal_incumplido: {result.to_fatal_flagged}")
     if result.failed:
         print(f"  failed case ids: {result.failed}")
 

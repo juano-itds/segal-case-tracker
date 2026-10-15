@@ -1532,3 +1532,108 @@ class TestEnApremio:
         case = _make_case(db)
         _recompute(db, case)
         assert case.en_apremio is False
+
+
+# ---------------------------------------------------------------------------
+# plazo_fatal_incumplido: the compliance axis, independent of the semáforo
+# ---------------------------------------------------------------------------
+
+
+class TestPlazoFatalIncumplido:
+    """A lost FATAL plazo must stay visible even though it leaves the active
+    set (so the semáforo goes green). The flag is the compliance axis; the
+    semáforo is the pending-action axis and must not change."""
+
+    NOTIF = TODAY - timedelta(days=30)
+
+    @property
+    def due(self) -> date:
+        from app.services.business_days import add_business_days
+
+        return add_business_days(self.NOTIF, 8)
+
+    def _seed(self, db, *, side: str = "demandado") -> Case:
+        case = _make_case(db)
+        _set_side(db, case, side)
+        _add_movement(
+            db, case.id, self.NOTIF, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"
+        )
+        return case
+
+    @staticmethod
+    def _excepciones_row(db, case) -> CaseDeadline:
+        return (
+            db.query(CaseDeadline)
+            .filter_by(case_id=case.id, deadline_type=DeadlineType.EXCEPCIONES_8D.value)
+            .one()
+        )
+
+    def test_late_defense_flags_the_case(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due + timedelta(days=3))
+        _recompute(db, case)
+        assert self._excepciones_row(db, case).status == "no_cumplido"
+        assert case.plazo_fatal_incumplido is True
+
+    def test_semaforo_is_unchanged_by_the_flag(self, db) -> None:
+        """Most important: the late case keeps the semáforo it always had
+        (the lost plazo leaves the active set), identical to the on-time one."""
+        late = self._seed(db)
+        _add_escrito(db, late.id, self.due + timedelta(days=3))
+        _recompute(db, late)
+        assert late.plazo_fatal_incumplido is True
+        assert late.semaforo == "verde"
+
+        db.query(CaseDeadline).filter_by(case_id=late.id).update({"status": "cumplido"})
+        db.flush()
+        _recompute(db, late)
+        assert late.plazo_fatal_incumplido is False
+        assert late.semaforo == "verde"  # same color with or without the flag
+
+    def test_on_time_defense_is_not_flagged(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        assert self._excepciones_row(db, case).status == "cumplido"
+        assert case.plazo_fatal_incumplido is False
+
+    def test_missed_non_fatal_plazo_is_not_flagged(self, db) -> None:
+        """termino_probatorio_10d is actionable for the firm but NOT fatal."""
+        case = self._seed(db)
+        _inject_deadline(
+            db, case.id, DeadlineType.TERMINO_PROBATORIO_10D,
+            calendar_due=TODAY - timedelta(days=5), status="no_cumplido",
+        )
+        _recompute(db, case)
+        assert case.plazo_fatal_incumplido is False
+
+    def test_fatal_plazo_not_actionable_for_the_side_is_not_flagged(self, db) -> None:
+        """excepciones_8d is the DEBTOR's plazo: for a demandante firm a missed
+        one is the counterparty's loss, not the firm's."""
+        case = self._seed(db, side="demandante")
+        _inject_deadline(
+            db, case.id, DeadlineType.EXCEPCIONES_8D,
+            calendar_due=self.due, status="no_cumplido",
+        )
+        _recompute(db, case)
+        assert case.plazo_fatal_incumplido is False
+
+    def test_flag_is_recomputed_when_the_auditor_corrects_the_row(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due + timedelta(days=3))
+        _recompute(db, case)
+        assert case.plazo_fatal_incumplido is True
+
+        self._excepciones_row(db, case).status = "cumplido"  # auditor correction
+        db.flush()
+        _recompute(db, case)
+        assert case.plazo_fatal_incumplido is False
+
+    def test_safe_fail_path_clears_the_flag(self, db) -> None:
+        """GRIS (indeterminate) writes every advisory flag back to False."""
+        case = self._seed(db)
+        case.plazo_fatal_incumplido = True
+        from app.services.deadline_engine import DeadlineEngine
+
+        DeadlineEngine._write_gris(case, db)
+        assert case.plazo_fatal_incumplido is False

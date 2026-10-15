@@ -81,6 +81,8 @@ class CaseResponse(BaseModel):
     titulo_tipo: Optional[str] = None
     titulo_fecha: Optional[date] = None
     prescripcion_cumplida: bool = False
+    # Compliance axis: a FATAL plazo of the firm was lost (see DeadlineEngine).
+    plazo_fatal_incumplido: bool = False
     prescripcion_fecha: Optional[date] = None
     # Sysgal cobertura (derived from the demandado's cached commercial state).
     # Populated ONLY for cases in abandono/apremio/prescripción that have a
@@ -737,6 +739,7 @@ async def list_cases(
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
             prescripcion_cumplida=case.prescripcion_cumplida or False,
+            plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
             matriz=case.matriz,
             matriz_etapa=case.matriz_etapa,
             matriz_origen=case.matriz_origen,
@@ -916,6 +919,7 @@ async def get_case(
         next_deadline_fatal=case.next_deadline_fatal or False,
         en_apremio=case.en_apremio or False,
         prescripcion_cumplida=case.prescripcion_cumplida or False,
+        plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
         matriz=case.matriz,
         matriz_etapa=case.matriz_etapa,
         matriz_origen=case.matriz_origen,

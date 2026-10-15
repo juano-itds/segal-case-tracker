@@ -186,3 +186,36 @@ def test_state_advanced_case_with_on_time_defense_is_cumplido_not_superseded(db,
     result = run(db, apply=True)
 
     assert (result.to_cumplido, result.other) == (1, 0)
+
+
+def test_late_defense_writes_and_reports_plazo_fatal_incumplido(db, owner):
+    on_time = _case(db, owner, "C-20-2026", escrito="Opone excepciones", escrito_day=DUE)
+    late = _case(
+        db, owner, "C-21-2026", escrito="Opone excepciones",
+        escrito_day=DUE + timedelta(days=3),
+    )
+    _stale_active_row(db, on_time)
+    _stale_active_row(db, late)
+
+    result = run(db, apply=True)
+
+    assert result.to_fatal_flagged == 1
+    db.expire_all()
+    assert db.get(Case, late.id).plazo_fatal_incumplido is True
+    assert db.get(Case, on_time.id).plazo_fatal_incumplido is False
+
+
+def test_dry_run_reports_the_flag_but_persists_nothing(db, owner):
+    late = _case(
+        db, owner, "C-22-2026", escrito="Opone excepciones",
+        escrito_day=DUE + timedelta(days=3),
+    )
+    _stale_active_row(db, late)
+    db.commit()
+    case_id = late.id
+
+    result = run(db)
+
+    assert result.to_fatal_flagged == 1
+    db.expire_all()
+    assert db.get(Case, case_id).plazo_fatal_incumplido is False
