@@ -620,3 +620,133 @@ def _format_exc_info(record) -> str:
     if not record.exc_info:
         return ""
     return "".join(traceback.format_exception(*record.exc_info))
+
+
+# ---------------------------------------------------------------------------
+# Per-document download budget (a hung fetch must not freeze the cycle)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _tiny_download_budget(monkeypatch):
+    """Shrink the per-document budget and the retry backoff for fast tests."""
+    monkeypatch.setattr(
+        "app.services.document_download_budget.DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS", 0.05
+    )
+    from app.config import settings
+    monkeypatch.setattr(settings, "PJUD_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(settings, "PJUD_RETRY_MAX_DELAY", 0.002)
+
+
+async def _hang_forever(*args, **kwargs):
+    import asyncio
+    await asyncio.Event().wait()
+
+
+async def _run_downloader(docs, scraper):
+    from app.services.document_downloader import DocumentDownloader
+    db = MagicMock()
+    storage_svc = _make_storage_svc()
+    await DocumentDownloader().download_and_store(
+        pending_docs=docs,
+        scraper=scraper,
+        pjud_session=MagicMock(),
+        db=db,
+        storage_service=storage_svc,
+        limiter=_make_limiter(),
+        enabled=True,
+    )
+    return storage_svc
+
+
+class TestDocumentDownloadBudget:
+    def test_the_shipped_budget_is_actually_bounded(self):
+        """The production value must stay a real ceiling.
+
+        Every other test in this class overrides the constant so it can run
+        fast, which leaves the shipped number untested: raising it to an
+        absurd value would silently remove the protection and no test would
+        complain. That is precisely the failure this module exists to stop —
+        a guard that looks present and is not. The bound is generous (the
+        measured p99 of 19,616 real downloads is 10.6s) but finite.
+        """
+        from app.services.document_download_budget import (
+            DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS as budget,
+        )
+
+        assert 0 < budget <= 300, (
+            f"budget is {budget}s: a download must stay bounded well below the "
+            f"16.6-minute hang this guard was added for"
+        )
+
+    @pytest.mark.asyncio
+    async def test_never_resolving_download_is_bounded(self, _tiny_download_budget):
+        """A fetch that never resolves ends in a bounded time, not a hang."""
+        import asyncio
+
+        scraper = MagicMock()
+        scraper.download_document_generic = _hang_forever
+        doc = _make_pending_doc(1)
+
+        # If the budget is missing this outer guard fires instead (RED).
+        await asyncio.wait_for(_run_downloader([doc], scraper), timeout=5)
+
+        assert doc.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_fast_download_is_unaffected(self, _tiny_download_budget):
+        scraper = _make_scraper([b"%PDF ok"])
+        doc = _make_pending_doc(1)
+
+        storage_svc = await _run_downloader([doc], scraper)
+
+        storage_svc.upload.assert_called_once_with(doc, b"%PDF ok")
+        assert scraper.download_document_generic.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_each_retry_gets_its_own_budget(self, _tiny_download_budget):
+        """Two timed-out attempts then a good one must succeed.
+
+        The attempts total >2x the budget. With a single clock wrapped OUTSIDE
+        ``resilient_call`` the third attempt would never complete.
+        """
+        import asyncio
+
+        calls = {"n": 0}
+
+        async def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                await asyncio.Event().wait()
+            return b"%PDF third time"
+
+        scraper = MagicMock()
+        scraper.download_document_generic = _flaky
+        doc = _make_pending_doc(1)
+
+        storage_svc = await asyncio.wait_for(
+            _run_downloader([doc], scraper), timeout=5
+        )
+
+        assert calls["n"] == 3
+        storage_svc.upload.assert_called_once_with(doc, b"%PDF third time")
+
+    @pytest.mark.asyncio
+    async def test_loop_continues_after_a_timeout(self, _tiny_download_budget):
+        import asyncio
+
+        async def _first_hangs(*args, **kwargs):
+            if kwargs["token"] == "HANG":
+                await asyncio.Event().wait()
+            return b"%PDF second"
+
+        scraper = MagicMock()
+        scraper.download_document_generic = _first_hangs
+        doc1 = _make_pending_doc(1, token="HANG")
+        doc2 = _make_pending_doc(2, token="OK")
+
+        storage_svc = await asyncio.wait_for(
+            _run_downloader([doc1, doc2], scraper), timeout=10
+        )
+
+        assert doc1.status == "failed"
+        storage_svc.upload.assert_called_once_with(doc2, b"%PDF second")

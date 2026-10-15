@@ -440,3 +440,43 @@ class TestDownloadDocument:
             assert resp.status_code == 404
         finally:
             app.dependency_overrides.pop(get_current_lawyer, None)
+
+
+class TestDownloadDocumentBudget:
+    def test_hung_download_returns_504_instead_of_hanging(
+        self, authed_client, document, monkeypatch
+    ):
+        """A fetch that never resolves must not hold the request forever."""
+        import asyncio
+
+        monkeypatch.setattr(
+            "app.services.document_download_budget.DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS",
+            0.05,
+        )
+
+        async def _hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with (
+            patch(
+                "app.api.v1.documents.get_session_store",
+                return_value=_make_session_store_mock(),
+            ),
+            patch("app.api.v1.documents.BrowserFactory") as mock_factory_cls,
+            patch("app.api.v1.documents.CivilScraper") as mock_scraper_cls,
+        ):
+            mock_factory = MagicMock()
+            mock_factory.__aenter__ = AsyncMock(return_value=mock_factory)
+            mock_factory.__aexit__ = AsyncMock(return_value=False)
+            mock_factory.new_page = AsyncMock(return_value=MagicMock())
+            mock_factory._browser = MagicMock()
+            mock_factory._context = MagicMock()
+            mock_factory_cls.return_value = mock_factory
+
+            mock_scraper = MagicMock()
+            mock_scraper.download_document_generic = _hang
+            mock_scraper_cls.return_value = mock_scraper
+
+            resp = authed_client.get(f"/api/v1/documents/{document.id}/download")
+
+        assert resp.status_code == 504

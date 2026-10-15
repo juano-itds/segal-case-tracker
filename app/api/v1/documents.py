@@ -13,6 +13,7 @@ GET /api/v1/documents/{document_id}/download
     - Returns 409 if not stored and no session is available.
 """
 
+import asyncio
 import logging
 from datetime import date, datetime
 from typing import AsyncIterator, List, Optional
@@ -37,6 +38,7 @@ from app.models.movement import Movement
 from app.scrapper.pjud.civil import CivilScraper
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
+from app.services.document_download_budget import download_with_budget
 from app.services.session_store import get_session_store
 from app.services.storage_service import StorageService, get_storage_backend
 
@@ -376,7 +378,8 @@ async def download_document(
             scraper._browser = factory._browser
             scraper._context = factory._context
 
-            pdf_bytes = await scraper.download_document_generic(
+            pdf_bytes = await download_with_budget(
+                scraper,
                 session=pjud_session,
                 endpoint=doc.pjud_endpoint,
                 doc_type=doc.doc_type or "resolution",
@@ -388,6 +391,12 @@ async def download_document(
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Document token expired — re-sync the case",
+        )
+    except asyncio.TimeoutError:
+        _logger.error("Download of document %s timed out", document_id)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Download timed out — try again later",
         )
     except ScrapingError as exc:
         _logger.error("Scraping error for document %s: %s", document_id, exc)
