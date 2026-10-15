@@ -95,17 +95,32 @@ def _scraper(page):
     return scraper
 
 
-def _seed(db, rol: str, checked: datetime | None) -> None:
-    lawyer = db.query(Lawyer).first()
+def _lawyer(db, rut: str = "11111111-1") -> Lawyer:
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == rut).first()
     if lawyer is None:
-        lawyer = Lawyer(rut="11111111-1", name="L", is_active=True)
+        lawyer = Lawyer(rut=rut, name=f"L {rut}", is_active=True)
         db.add(lawyer)
         db.flush()
-    court = db.query(Court).first()
+    return lawyer
+
+
+def _court(db, name: str = "Tribunal") -> Court:
+    court = db.query(Court).filter(Court.name == name).first()
     if court is None:
-        court = Court(code="T", name="Tribunal", region="RM", type="civil")
+        court = Court(
+            code=f"C{db.query(Court).count() + 1}", name=name, region="RM", type="civil"
+        )
         db.add(court)
         db.flush()
+    return court
+
+
+def _seed(
+    db, rol: str, checked: datetime | None, *,
+    lawyer_rut: str = "11111111-1", court_name: str = "Tribunal",
+) -> Lawyer:
+    lawyer = _lawyer(db, lawyer_rut)
+    court = _court(db, court_name)
     db.add(
         Case(
             lawyer_id=lawyer.id, court_id=court.id, rol=rol, competencia="civil",
@@ -114,6 +129,12 @@ def _seed(db, rol: str, checked: datetime | None) -> None:
         )
     )
     db.commit()
+    return lawyer
+
+
+def _rows(*pairs):
+    """Feed rows as (rol, tribunal-or-None) pairs."""
+    return [probe.FeedRow(rol=r, tribunal=t) for r, t in pairs]
 
 
 def _enable(monkeypatch, value=True):
@@ -155,6 +176,7 @@ class TestClassification:
         ])))
         assert r.outcome == probe.OK
         assert r.rols == ["C-1-2026", "C-2-2026"]
+        assert [row.tribunal for row in r.rows] == ["1 Civil", "2 Civil"]
 
     def test_empty_tbody_is_no_activity_not_dead(self):
         r = probe.classify_response(_resp(_table([])))
@@ -198,6 +220,24 @@ class TestClassification:
         )
         r = probe.classify_response(_resp(html))
         assert r.rols == ["C-9-2026"]
+        assert r.rows[0].tribunal == "1 Civil"
+
+    def test_table_without_a_tribunal_column_still_parses_with_none(self):
+        """The tribunal column may be absent (other competencia / header):
+        that is not an error, the tribunal is just unknown."""
+        html = (
+            "<table><thead><tr><th>Rol</th><th>Fecha</th><th>Caratulado</th>"
+            "</tr></thead><tbody>"
+            "<tr><td>c-9-2026</td><td>13/10/2026</td><td>A/B</td></tr>"
+            "</tbody></table>"
+        )
+        r = probe.classify_response(_resp(html))
+        assert r.outcome == probe.OK
+        assert r.rows == [probe.FeedRow(rol="C-9-2026", tribunal=None)]
+
+    def test_blank_tribunal_cell_is_none(self):
+        r = probe.classify_response(_resp(_table([("C-1-2026", "13/10/2026", "A/B", "  ")])))
+        assert r.rows[0].tribunal is None
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +246,13 @@ class TestClassification:
 
 class TestStats:
     def test_counts_found_missing_median_and_max(self, db):
-        _seed(db, "C-1-2026", NOW - timedelta(days=2))
+        lawyer = _seed(db, "C-1-2026", NOW - timedelta(days=2))
         _seed(db, "C-2-2026", NOW - timedelta(days=8))
         _seed(db, "C-3-2026", NOW - timedelta(days=96))
         s = probe.staleness_stats(
-            lambda: db, ["C-1-2026", "C-2-2026", "C-3-2026", "C-9-2026"], NOW
+            lambda: db,
+            _rows(("C-1-2026", None), ("C-2-2026", None), ("C-3-2026", None), ("C-9-2026", None)),
+            NOW, lawyer.id,
         )
         assert (s.in_db, s.not_in_db) == (3, 1)
         assert s.median_days == 8.0
@@ -218,16 +260,129 @@ class TestStats:
         assert s.never_checked == 0
 
     def test_never_checked_cases_are_counted_apart(self, db):
-        _seed(db, "C-1-2026", None)
+        lawyer = _seed(db, "C-1-2026", None)
         _seed(db, "C-2-2026", NOW - timedelta(days=4))
-        s = probe.staleness_stats(lambda: db, ["C-1-2026", "C-2-2026"], NOW)
+        s = probe.staleness_stats(
+            lambda: db, _rows(("C-1-2026", None), ("C-2-2026", None)), NOW, lawyer.id
+        )
         assert (s.in_db, s.never_checked) == (2, 1)
         assert s.median_days == 4.0 and s.max_days == 4.0
 
     def test_duplicate_rols_in_the_feed_count_once(self, db):
-        _seed(db, "C-1-2026", NOW - timedelta(days=1))
-        s = probe.staleness_stats(lambda: db, ["C-1-2026", "C-1-2026"], NOW)
+        lawyer = _seed(db, "C-1-2026", NOW - timedelta(days=1))
+        s = probe.staleness_stats(
+            lambda: db, _rows(("C-1-2026", None), ("C-1-2026", None)), NOW, lawyer.id
+        )
         assert (s.in_db, s.not_in_db) == (1, 0)
+
+
+class TestLawyerScope:
+    def test_rol_owned_by_another_lawyer_is_other_lawyer_not_in_db(self, db):
+        mine = _seed(db, "C-1-2026", NOW - timedelta(days=1))
+        _seed(db, "C-2-2026", NOW - timedelta(days=1), lawyer_rut="22222222-2")
+        s = probe.staleness_stats(
+            lambda: db, _rows(("C-1-2026", None), ("C-2-2026", None)), NOW, mine.id
+        )
+        assert s.in_db == 1
+        assert s.other_lawyer == 1
+        # not_in_db = "not found for this lawyer"; other_lawyer is the subset
+        # of it that exists elsewhere in the firm.
+        assert s.not_in_db == 1
+
+    def test_rol_nobody_has_is_not_in_db_and_not_other_lawyer(self, db):
+        mine = _seed(db, "C-1-2026", NOW - timedelta(days=1))
+        s = probe.staleness_stats(
+            lambda: db, _rows(("C-1-2026", None), ("C-9-2026", None)), NOW, mine.id
+        )
+        assert (s.in_db, s.not_in_db, s.other_lawyer) == (1, 1, 0)
+
+    def test_age_is_computed_only_over_this_lawyers_cases(self, db):
+        mine = _seed(db, "C-1-2026", NOW - timedelta(days=2))
+        # same ROL under another lawyer, far staler: must not leak into the age
+        _seed(db, "C-1-2026", NOW - timedelta(days=300), lawyer_rut="22222222-2")
+        s = probe.staleness_stats(lambda: db, _rows(("C-1-2026", None)), NOW, mine.id)
+        assert s.in_db == 1
+        assert s.median_days == 2.0 and s.max_days == 2.0
+
+    def test_never_checked_is_only_over_this_lawyers_cases(self, db):
+        mine = _seed(db, "C-1-2026", NOW - timedelta(days=2))
+        _seed(db, "C-1-2026", None, lawyer_rut="22222222-2")
+        s = probe.staleness_stats(lambda: db, _rows(("C-1-2026", None)), NOW, mine.id)
+        assert s.never_checked == 0
+
+
+class TestCourtComparison:
+    def _stats(self, db, lawyer, *pairs):
+        return probe.staleness_stats(lambda: db, _rows(*pairs), NOW, lawyer.id)
+
+    def test_same_rol_in_another_court_is_court_mismatch(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")  # a known court, but not ours
+        s = self._stats(db, lawyer, ("C-1-2026", "3º Juzgado Civil de Santiago"))
+        assert s.in_db == 1
+        assert (s.court_mismatch, s.court_unknown) == (1, 0)
+
+    def test_matching_court_counts_nothing_extra(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        s = self._stats(db, lawyer, ("C-1-2026", "21º Juzgado Civil de Santiago"))
+        assert (s.in_db, s.court_mismatch, s.court_unknown) == (1, 0, 0)
+
+    def test_ordinal_accent_case_and_spacing_do_not_matter(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        s = self._stats(db, lawyer, ("C-1-2026", "21 JUZGADO CIVIL DE SANTIAGO"))
+        assert (s.court_mismatch, s.court_unknown) == (0, 0)
+
+    def test_degree_sign_and_accents_are_the_same_court(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="1º Juzgado Civil de Valparaíso")
+        s = self._stats(db, lawyer, ("C-1-2026", "  1°  juzgado civil   de VALPARAISO "))
+        assert (s.court_mismatch, s.court_unknown) == (0, 0)
+
+    def test_unrecognisable_court_name_is_unknown_never_mismatch(self, db):
+        """A false mismatch fabricates an identity bug that does not exist.
+        If the feed's name cannot be resolved against courts.name, we count
+        court_unknown -- under-count the finding rather than invent it."""
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")
+        for garbled in ("21 Civil", "Juzgado de Letras de Quilicura", "???", "Santiago"):
+            s = self._stats(db, lawyer, ("C-1-2026", garbled))
+            assert (s.court_mismatch, s.court_unknown) == (0, 1), garbled
+
+    def test_unresolvable_does_not_become_mismatch_even_if_names_differ(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="Tribunal")
+        s = self._stats(db, lawyer, ("C-1-2026", "Un tribunal que no existe"))
+        assert s.court_mismatch == 0 and s.court_unknown == 1
+
+    def test_row_without_tribunal_is_unknown_and_breaks_nothing(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW)
+        s = self._stats(db, lawyer, ("C-1-2026", None))
+        assert (s.in_db, s.court_mismatch, s.court_unknown) == (1, 0, 1)
+
+    def test_one_certain_mismatch_plus_one_unknown_row_stays_unknown(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")
+        s = self._stats(
+            db, lawyer,
+            ("C-1-2026", "3º Juzgado Civil de Santiago"), ("C-1-2026", "garbled"),
+        )
+        assert (s.court_mismatch, s.court_unknown) == (0, 1)
+
+    def test_a_matching_row_wins_over_a_second_row_in_another_court(self, db):
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")
+        s = self._stats(
+            db, lawyer,
+            ("C-1-2026", "3º Juzgado Civil de Santiago"),
+            ("C-1-2026", "21 JUZGADO CIVIL DE SANTIAGO"),
+        )
+        assert (s.court_mismatch, s.court_unknown) == (0, 0)
+
+    def test_court_is_not_assessed_for_rols_this_lawyer_does_not_have(self, db):
+        mine = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _seed(db, "C-2-2026", NOW, lawyer_rut="22222222-2",
+              court_name="3º Juzgado Civil de Santiago")
+        s = self._stats(db, mine, ("C-2-2026", "3º Juzgado Civil de Santiago"))
+        assert (s.in_db, s.other_lawyer) == (0, 1)
+        assert (s.court_mismatch, s.court_unknown) == (0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -369,18 +524,21 @@ class TestLogLines:
     @pytest.mark.asyncio
     async def test_ok_line(self, monkeypatch, limiter, db, log):
         _enable(monkeypatch)
-        _seed(db, "C-1-2026", NOW - timedelta(days=8))
+        lawyer = _seed(db, "C-1-2026", NOW - timedelta(days=8))
         _seed(db, "C-2-2026", NOW - timedelta(days=96))
         body = _table([
             ("C-1-2026", "13/10/2026", "A/B", "1 Civil"),
             ("C-2-2026", "13/10/2026", "A/B", "1 Civil"),
             ("C-3-2026", "13/10/2026", "A/B", "1 Civil"),
         ])
-        await _run(_scraper(_page(_resp(body))), db)
+        await probe.run_estado_diario_probe(
+            scraper=_scraper(_page(_resp(body))), lawyer_id=lawyer.id,
+            competencia="civil", today=TODAY, now=NOW, session_factory=lambda: db,
+        )
         line = _logged(log)[-1]
         assert line.startswith("ESTADO_DIARIO_PROBE ")
         for part in (
-            "lawyer=8", "date=13/10/2026", "outcome=ok", "rows=3", "in_db=2",
+            f"lawyer={lawyer.id}", "date=13/10/2026", "outcome=ok", "rows=3", "in_db=2",
             "not_in_db=1", "age_days_median=52.0", "age_days_max=96.0",
         ):
             assert part in line, line
@@ -412,6 +570,117 @@ class TestLogLines:
         assert "outcome=endpoint_changed" in line and "status=404" in line
         assert "no_activity" not in line
         log.warning.assert_called()
+
+
+class TestNewLogFields:
+    @pytest.mark.asyncio
+    async def test_ok_line_carries_the_new_fields_after_the_existing_ones(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-1-2026", NOW - timedelta(days=8),
+                       court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")
+        _seed(db, "C-2-2026", NOW, lawyer_rut="22222222-2")
+        body = _table([
+            ("C-1-2026", "13/10/2026", "A/B", "3º Juzgado Civil de Santiago"),
+            ("C-2-2026", "13/10/2026", "A/B", "1 Civil"),
+            ("C-3-2026", "13/10/2026", "A/B", "1 Civil"),
+        ])
+        await probe.run_estado_diario_probe(
+            scraper=_scraper(_page(_resp(body))), lawyer_id=lawyer.id,
+            competencia="civil", today=TODAY, now=NOW, session_factory=lambda: db,
+        )
+        line = _logged(log)[-1]
+        for part in ("in_db=1", "not_in_db=2", "other_lawyer=1",
+                     "court_mismatch=1", "court_unknown=0"):
+            assert part in line, line
+        # existing fields keep their names and order; new ones are appended
+        keys = [kv.split("=")[0] for kv in line.split(" ")[1:] if "=" in kv]
+        assert keys == [
+            "lawyer", "date", "outcome", "rows", "in_db", "not_in_db",
+            "never_checked", "age_days_median", "age_days_max",
+            "other_lawyer", "court_mismatch", "court_unknown",
+        ], keys
+
+
+class TestSampleLines:
+    """A bounded sample of the ROLs behind each counter, on separate lines."""
+
+    async def _go(self, db, log, body, lawyer_id):
+        await probe.run_estado_diario_probe(
+            scraper=_scraper(_page(_resp(body))), lawyer_id=lawyer_id,
+            competencia="civil", today=TODAY, now=NOW, session_factory=lambda: db,
+        )
+        return [l for l in _logged(log) if l.startswith("ESTADO_DIARIO_PROBE_SAMPLE ")]
+
+    @pytest.mark.asyncio
+    async def test_not_in_db_sample_is_capped_at_20_and_counts_the_rest(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-900-2026", NOW)
+        rows = [(f"C-{i:03d}-2026", "13/10/2026", "A/B", "3º Juzgado Civil de Santiago")
+                for i in range(25)]
+        lines = await self._go(db, log, _table(rows), lawyer.id)
+        assert len(lines) == 1, lines
+        line = lines[0]
+        assert "category=not_in_db" in line
+        assert "total=25 shown=20 omitted=5" in line
+        assert f"lawyer={lawyer.id}" in line and "date=13/10/2026" in line
+        # sorted, first 20 only, with the feed tribunal next to each ROL
+        assert "C-000-2026@3º Juzgado Civil de Santiago" in line
+        assert "C-019-2026@" in line
+        assert "C-020-2026" not in line
+        log.warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_tribunal_is_shown_as_a_dash(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-900-2026", NOW)
+        html = (
+            "<table><thead><tr><th>Rol</th><th>Caratulado</th></tr></thead><tbody>"
+            "<tr><td>C-1-2026</td><td>A/B</td></tr></tbody></table>"
+        )
+        lines = await self._go(db, log, html, lawyer.id)
+        assert "C-1-2026@-" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_each_category_gets_its_own_line(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-1-2026", NOW, court_name="21º Juzgado Civil de Santiago")
+        _court(db, "3º Juzgado Civil de Santiago")
+        _seed(db, "C-2-2026", NOW, lawyer_rut="22222222-2")
+        body = _table([
+            ("C-1-2026", "13/10/2026", "A/B", "3º Juzgado Civil de Santiago"),
+            ("C-2-2026", "13/10/2026", "A/B", "1 Civil"),
+            ("C-3-2026", "13/10/2026", "A/B", "1 Civil"),
+        ])
+        lines = await self._go(db, log, body, lawyer.id)
+        by_cat = {l.split("category=")[1].split(" ")[0]: l for l in lines}
+        assert set(by_cat) == {"not_in_db", "other_lawyer", "court_mismatch"}
+        assert "C-3-2026" in by_cat["not_in_db"] and "C-2-2026" not in by_cat["not_in_db"]
+        assert "C-2-2026" in by_cat["other_lawyer"] and "C-3-2026" not in by_cat["other_lawyer"]
+        assert "C-1-2026@3º Juzgado Civil de Santiago" in by_cat["court_mismatch"]
+
+    @pytest.mark.asyncio
+    async def test_nothing_missing_emits_no_sample_line(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-1-2026", NOW)
+        lines = await self._go(
+            db, log, _table([("C-1-2026", "13/10/2026", "A/B", "Tribunal")]), lawyer.id
+        )
+        assert lines == []
+
+    @pytest.mark.asyncio
+    async def test_the_counters_line_is_untouched_by_the_samples(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _seed(db, "C-900-2026", NOW)
+        await self._go(db, log, _table([("C-1-2026", "13/10/2026", "A/B", "T")]), lawyer.id)
+        counters = [l for l in _logged(log) if l.startswith("ESTADO_DIARIO_PROBE lawyer=")]
+        assert len(counters) == 1 and "category=" not in counters[0]
 
 
 class TestFailureIsolation:

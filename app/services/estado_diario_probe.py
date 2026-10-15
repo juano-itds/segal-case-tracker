@@ -28,13 +28,15 @@ import json
 import logging
 import re
 import statistics
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from app.config import settings
 from app.core.database import SessionLocal
 from app.models.case import Case
+from app.models.court import Court
 from app.scrapper.pjud.base import (
     _DETAIL_SESSION_URL_MARKERS,
     classify_small_detail_modal,
@@ -70,21 +72,48 @@ _CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+@dataclass(frozen=True)
+class FeedRow:
+    """One row of the feed. ``tribunal`` is None when the feed did not carry it."""
+
+    rol: str
+    tribunal: Optional[str] = None
+
+
 @dataclass
 class ProbeResult:
     outcome: str
     status: Optional[int] = None
-    rols: List[str] = field(default_factory=list)
+    rows: List[FeedRow] = field(default_factory=list)
     detail: str = ""
+
+    @property
+    def rols(self) -> List[str]:
+        return [r.rol for r in self.rows]
 
 
 @dataclass
 class Staleness:
+    """Coverage of the feed for ONE lawyer.
+
+    ``in_db``/``not_in_db`` partition the distinct ROLs of the feed by whether
+    this lawyer has them. ``other_lawyer`` is the subset of ``not_in_db`` whose
+    ROL exists in the firm under someone else. The court counters only look at
+    ROLs found for this lawyer; ``court_mismatch`` is the identity-bug signal
+    and is counted only when the comparison is certain.
+    """
+
     in_db: int
     not_in_db: int
     never_checked: int
     median_days: Optional[float]
     max_days: Optional[float]
+    other_lawyer: int = 0
+    court_mismatch: int = 0
+    court_unknown: int = 0
+    # Full, sorted (rol, feed tribunal) lists behind the counters, keyed by
+    # category (not_in_db = nowhere in the firm, other_lawyer, court_mismatch).
+    samples: Dict[str, List[FeedRow]] = field(default_factory=dict)
 
 
 def _clean(cell: str) -> str:
@@ -132,35 +161,129 @@ def classify_response(response) -> ProbeResult:
         return ProbeResult(ENDPOINT_CHANGED, status_n, detail="unrecognised response")
 
     rol_idx = header_cells.index("rol")
-    rols = [
-        r[rol_idx].upper() for r in data_rows if len(r) > rol_idx and r[rol_idx]
-    ]
-    if not rols:
+    tribunal_idx = header_cells.index("tribunal") if "tribunal" in header_cells else None
+    feed_rows: List[FeedRow] = []
+    for r in data_rows:
+        if len(r) <= rol_idx or not r[rol_idx]:
+            continue
+        tribunal = None
+        if tribunal_idx is not None and len(r) > tribunal_idx:
+            tribunal = r[tribunal_idx] or None
+        feed_rows.append(FeedRow(rol=r[rol_idx].upper(), tribunal=tribunal))
+    if not feed_rows:
         return ProbeResult(NO_ACTIVITY, status_n)
-    return ProbeResult(OK, status_n, rols=rols)
+    return ProbeResult(OK, status_n, rows=feed_rows)
+
+
+def normalize_court_name(name: Optional[str]) -> str:
+    """Comparable form of a court name: upper case, no accents, no ordinal
+    signs, single spaces. "21º Juzgado Civil" and "21 JUZGADO CIVIL" collapse
+    to the same string. Exact equality of this form is the ONLY way two names
+    are considered the same court: no fuzzy or substring matching."""
+    if not name:
+        return ""
+    s = name.replace("\u00ba", "").replace("\u00b0", "")  # º and °
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s).strip().upper()
 
 
 def staleness_stats(
-    session_factory: Callable, rols: List[str], now: datetime
+    session_factory: Callable,
+    rows: List[FeedRow],
+    now: datetime,
+    lawyer_id: int,
 ) -> Staleness:
-    """How stale (days since last_detail_checked_at) are the ROLs we already have."""
-    unique = sorted(set(rols))
+    """Coverage and staleness of the feed's ROLs for ONE lawyer.
+
+    Matches ``Case.rol`` AND ``Case.lawyer_id``: matching by ROL alone counted
+    other lawyers' causas as ours (the same ROL repeats across lawyers and
+    across courts) and was blind to the "same ROL, other court" bug.
+
+    The court comparison fails toward "unknown", never toward "mismatch": a
+    mismatch is counted only when the feed's tribunal resolves, by exact
+    normalised equality, to a known ``courts.name`` and none of this lawyer's
+    cases with that ROL sits in such a court.
+    """
+    unique = sorted({r.rol for r in rows})
+    tribunals_by_rol: dict = {}
+    for r in rows:
+        tribunals_by_rol.setdefault(r.rol, set()).add(normalize_court_name(r.tribunal))
+
     db = session_factory()
     try:
         found = (
-            db.query(Case.rol, Case.last_detail_checked_at)
-            .filter(Case.rol.in_(unique))
+            db.query(Case.rol, Case.last_detail_checked_at, Case.court_id)
+            .filter(Case.rol.in_(unique), Case.lawyer_id == lawyer_id)
             .all()
         )
+        found_rols = {rol for rol, _, _ in found}
+        missing = [r for r in unique if r not in found_rols]
+        elsewhere = set()
+        if missing:
+            elsewhere = {
+                rol
+                for (rol,) in db.query(Case.rol)
+                .filter(Case.rol.in_(missing), Case.lawyer_id != lawyer_id)
+                .distinct()
+                .all()
+            }
+        court_ids_by_name: dict = {}
+        if found and any(t for ts in tribunals_by_rol.values() for t in ts):
+            for cid, cname in db.query(Court.id, Court.name).all():
+                key = normalize_court_name(cname)
+                if key:
+                    court_ids_by_name.setdefault(key, set()).add(cid)
     finally:
         db.close()
-    checked = {}
-    for rol, ts in found:
+
+    checked: dict = {}
+    court_ids: dict = {}
+    for rol, ts, court_id in found:
         # keep the stalest timestamp if a ROL appears twice
         if rol not in checked or (ts is None) or (
             checked[rol] is not None and ts < checked[rol]
         ):
             checked[rol] = ts
+        court_ids.setdefault(rol, set()).add(court_id)
+
+    mismatch_rols: List[str] = []
+    mismatch = unknown = 0
+    for rol in checked:
+        verdicts = set()
+        for tribunal in tribunals_by_rol.get(rol, {""}):
+            resolved = court_ids_by_name.get(tribunal) if tribunal else None
+            if not resolved:
+                verdicts.add("unknown")
+            elif resolved & court_ids[rol]:
+                verdicts.add("match")
+            else:
+                verdicts.add("mismatch")
+        # One feed row matching our court settles the ROL. A mismatch needs
+        # EVERY row for the ROL to be a certain mismatch; any doubt is unknown.
+        if "match" in verdicts:
+            continue
+        if verdicts == {"mismatch"}:
+            mismatch += 1
+            mismatch_rols.append(rol)
+        else:
+            unknown += 1
+
+    feed_tribunal: dict = {}
+    for r in rows:
+        if r.tribunal and (r.rol not in feed_tribunal or r.tribunal < feed_tribunal[r.rol]):
+            feed_tribunal[r.rol] = r.tribunal
+
+    def _sample(rols) -> List[FeedRow]:
+        return [FeedRow(rol=r, tribunal=feed_tribunal.get(r)) for r in sorted(rols)]
+
+    nowhere = [r for r in missing if r not in elsewhere]
+    samples = {
+        "not_in_db": _sample(nowhere),
+        "other_lawyer": _sample(elsewhere),
+        "court_mismatch": _sample(mismatch_rols),
+    }
+
     ages = [
         (now - ts).total_seconds() / 86400.0
         for ts in checked.values()
@@ -172,6 +295,10 @@ def staleness_stats(
         never_checked=sum(1 for ts in checked.values() if ts is None),
         median_days=round(statistics.median(ages), 1) if ages else None,
         max_days=round(max(ages), 1) if ages else None,
+        other_lawyer=len(elsewhere),
+        court_mismatch=mismatch,
+        court_unknown=unknown,
+        samples={k: v for k, v in samples.items() if v},
     )
 
 
@@ -231,6 +358,34 @@ async def fetch_estado_diario(page, fecha: str) -> dict:
     return await page.evaluate(js)
 
 
+SAMPLE_LIMIT = 20
+_SAMPLE_ORDER = ("not_in_db", "other_lawyer", "court_mismatch")
+
+
+def _log_samples(lawyer_id, fecha: str, stats: Staleness) -> None:
+    """One INFO line per non-empty category, at most SAMPLE_LIMIT ROLs each.
+
+    Separate prefix token (ESTADO_DIARIO_PROBE_SAMPLE) so the parser of the
+    counters line (``ESTADO_DIARIO_PROBE lawyer=...``) never sees these.
+    Entries are ``ROL@tribunal`` (``-`` when the feed had none), ``;``-joined
+    inside double quotes.
+    """
+    for category in _SAMPLE_ORDER:
+        rows = stats.samples.get(category)
+        if not rows:
+            continue
+        shown = rows[:SAMPLE_LIMIT]
+        entries = "; ".join(
+            f"{r.rol}@{(r.tribunal or '-').replace(chr(34), chr(39))}" for r in shown
+        )
+        logger.info(
+            'ESTADO_DIARIO_PROBE_SAMPLE lawyer=%s date=%s category=%s total=%d '
+            'shown=%d omitted=%d rols="%s"',
+            lawyer_id, fecha, category, len(rows), len(shown),
+            len(rows) - len(shown), entries,
+        )
+
+
 def _fmt(value) -> str:
     return "n/a" if value is None else str(value)
 
@@ -267,12 +422,21 @@ async def run_estado_diario_probe(
         result = classify_response(await fetch_estado_diario(page, fecha))
 
         if result.outcome == OK:
-            stats = staleness_stats(session_factory, result.rols, now or datetime.utcnow())
+            stats = staleness_stats(
+                session_factory, result.rows, now or datetime.utcnow(), lawyer_id
+            )
+            # Sample lines go first so the counters line stays the last one of
+            # the probe for this lawyer, as before.
+            _log_samples(lawyer_id, fecha, stats)
+            # Existing keys keep their names and order (a script parses this
+            # line); new keys are only appended.
             logger.info(
                 "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s rows=%d in_db=%d "
-                "not_in_db=%d never_checked=%d age_days_median=%s age_days_max=%s",
-                lawyer_id, fecha, OK, len(result.rols), stats.in_db, stats.not_in_db,
+                "not_in_db=%d never_checked=%d age_days_median=%s age_days_max=%s "
+                "other_lawyer=%d court_mismatch=%d court_unknown=%d",
+                lawyer_id, fecha, OK, len(result.rows), stats.in_db, stats.not_in_db,
                 stats.never_checked, _fmt(stats.median_days), _fmt(stats.max_days),
+                stats.other_lawyer, stats.court_mismatch, stats.court_unknown,
             )
         elif result.outcome == NO_ACTIVITY:
             logger.info(
