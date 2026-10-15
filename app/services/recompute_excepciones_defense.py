@@ -16,7 +16,7 @@ not part of this job.
 SAFETY
 * Dry-run by default: the recompute is executed to learn the real outcome, then
   rolled back. Nothing is persisted.
-* Each case runs in a SAVEPOINT. A case the engine safe-fails to GRIS is rolled
+* With --apply each case runs in a SAVEPOINT. A case the engine safe-fails to GRIS is rolled
   back and reported, never persisted.
 * Alerts fire only from ``sync_service.emit_deadline_alerts`` off the
   transition ``recompute_case`` returns. This module never calls it, so a
@@ -148,15 +148,20 @@ def run(db: Session, *, apply: bool = False) -> Result:
             before = [(r.id, r.status, r.due_date) for r in rows]
             old_semaforo = case.semaforo
 
-            savepoint = db.begin_nested()
+            # The savepoint only matters when persisting. A dry-run relies on
+            # the plain end-of-chunk rollback instead: releasing a savepoint
+            # must never be what decides whether a dry-run writes.
+            savepoint = db.begin_nested() if apply else None
             DeadlineEngine.recompute_case(db, case)
             if case.semaforo == "gris" and old_semaforo != "gris":
                 # recompute_case safe-fails to GRIS on any internal error.
-                savepoint.rollback()
+                if savepoint is not None:
+                    savepoint.rollback()
                 result.failed.append(case_id)
                 logger.warning("excepciones defense recompute failed for case %s", case_id)
                 continue
-            savepoint.commit()
+            if savepoint is not None:
+                savepoint.commit()
 
             for (row_id, old_status, due) in before:
                 row = db.get(CaseDeadline, row_id)
