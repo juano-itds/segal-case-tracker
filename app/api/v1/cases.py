@@ -7,7 +7,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import nullslast, or_, func, not_
+from sqlalchemy import nullslast, or_, func, not_, select
 
 from app.api.deps import (
     get_db,
@@ -118,9 +118,21 @@ class MovementResponse(BaseModel):
         from_attributes = True
 
 
+class CaseListItem(CaseResponse):
+    """A row of ``GET /cases``: the case plus its defendants' RUTs.
+
+    Kept off ``CaseResponse`` because that model is also the detail payload,
+    where an always-empty ``ruts`` would read as "no defendant RUT".
+    """
+
+    # Defendant (participante "DDO.") RUTs, same shape as the verdicts
+    # endpoint, so clients can filter a list by RUT without another request.
+    ruts: List[str] = []
+
+
 class CaseListResponse(BaseModel):
     """Paginated case list."""
-    items: List[CaseResponse]
+    items: List[CaseListItem]
     total: int
     page: int
     per_page: int
@@ -290,6 +302,57 @@ _SYSGAL_STATE_FLAGS = or_(
 # When a case has several demandados with different coberturas, the tag shows
 # the most-covered one (any demandado with active coverage covers the causa).
 _COBERTURA_PRIORITY = {c: i for i, c in enumerate(COBERTURAS)}
+
+
+_RUT_SHAPE = re.compile(r"^\d{6,8}-[\dK]$")
+
+
+def _defendant_rut_clause(q: str):
+    """EXISTS clause matching ``q`` against a defendant RUT, or None.
+
+    Only a term that looks like a whole RUT (after ``clean_rut``) produces a
+    clause, so plain-text searches keep their exact SQL and a partial number
+    never turns into a RUT lookup. Equality on both sides normalised: the user
+    pastes ``12.345.678-9``, litigantes store ``12345678-9``. Defendant only
+    ("DDO."): the plaintiff is usually the bank and would match every case it
+    sues.
+    """
+    cleaned = clean_rut(q)
+    if not _RUT_SHAPE.match(cleaned):
+        return None
+    return (
+        select(1)
+        .where(
+            CaseLitigante.case_id == Case.id,
+            CaseLitigante.participante == "DDO.",
+            CaseLitigante.rut == cleaned,
+        )
+        .exists()
+    )
+
+
+def _defendant_ruts_by_case(db: Session, case_ids) -> dict[int, list[str]]:
+    """Defendant RUTs per case id, one query for all ids (never per case)."""
+    ids = list(case_ids)
+    if not ids:
+        return {}
+    rows = (
+        db.query(CaseLitigante.case_id, CaseLitigante.rut)
+        .filter(
+            CaseLitigante.case_id.in_(ids),
+            CaseLitigante.participante == "DDO.",
+            CaseLitigante.rut.isnot(None),
+            CaseLitigante.rut != "",
+        )
+        .distinct()
+        .all()
+    )
+    by_case: dict[int, list[str]] = {}
+    for case_id, rut in rows:
+        by_case.setdefault(case_id, []).append(rut)
+    for ruts in by_case.values():
+        ruts.sort()
+    return by_case
 
 
 def _case_in_sysgal_states(case: Case) -> bool:
@@ -532,16 +595,17 @@ async def list_cases(
     # N+1 kill: eager-load the court so building CourtInfo per row is free.
     query = query.options(joinedload(Case.court))
 
-    # Free-text search over rol / plaintiff / defendant (case-insensitive).
+    # Free-text search over rol / plaintiff / defendant (case-insensitive),
+    # plus the defendant's RUT when the term is shaped like one.
     if q and q.strip():
         term = f"%{q.strip()}%"
-        query = query.filter(
-            or_(
-                Case.rol.ilike(term),
-                Case.plaintiff.ilike(term),
-                Case.defendant.ilike(term),
-            )
+        text_match = or_(
+            Case.rol.ilike(term),
+            Case.plaintiff.ilike(term),
+            Case.defendant.ilike(term),
         )
+        rut_match = _defendant_rut_clause(q)
+        query = query.filter(or_(text_match, rut_match) if rut_match is not None else text_match)
 
     # Semáforo / category quick-filter.
     if sem == "rojo":
@@ -630,6 +694,9 @@ async def list_cases(
     sysgal_ids = [c.id for c in cases if _case_in_sysgal_states(c)]
     sysgal_info = _sysgal_info_by_case(db, sysgal_ids) if sysgal_ids else {}
 
+    # Defendant RUTs for this page (1 query, no N+1).
+    ruts_by_case = _defendant_ruts_by_case(db, [c.id for c in cases])
+
     # Assigned-lawyer names for this page (1 query, no N+1) — asignación por nivel.
     assigned_ids = {c.assigned_lawyer_id for c in cases if c.assigned_lawyer_id}
     assigned_names = (
@@ -649,8 +716,9 @@ async def list_cases(
                 region=case.court.region,
             )
         
-        items.append(CaseResponse(
+        items.append(CaseListItem(
             id=case.id,
+            ruts=ruts_by_case.get(case.id, []),
             rol=case.rol,
             competencia=case.competencia or "civil",
             court=court_info,
