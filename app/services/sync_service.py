@@ -2517,8 +2517,13 @@ async def detect_and_sync_movements(
             # Hard timeout scoped to JUST the browser fetch (panel + detail) — the
             # op that hangs on an unresponsive Shape/PJUD page (page.evaluate /
             # page.goto have no native timeout). Document downloads run AFTER this
-            # with their own retry/rate-limit resilience and must NOT share this
-            # budget, or a legitimately slow multi-document case is falsely killed.
+            # and must NOT share this per-case budget, or a legitimately slow
+            # multi-document case is falsely killed. They are NOT unprotected
+            # though: retry/rate-limit resilience does not bound a call that never
+            # returns (that is what froze the station), so each download carries
+            # its own per-DOCUMENT budget (DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS).
+            # Documents are fetched one at a time, so every one starts a fresh
+            # clock and a case with many documents is not penalised.
             detail = await asyncio.wait_for(
                 resilient_call(
                     "detail",

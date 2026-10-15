@@ -22,6 +22,7 @@ from typing import List, TYPE_CHECKING
 
 from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
 from app.services.cycle_timing import timed_async
+from app.services.document_download_budget import download_with_budget
 
 if TYPE_CHECKING:
     from app.models.document import Document
@@ -106,9 +107,13 @@ class DocumentDownloader:
 
             try:
                 from app.scrapper.pjud.resilience.integration import resilient_call
+                # The budget wraps the coroutine INSIDE resilient_call so every
+                # retry attempt gets its own clock; a timeout is a retryable
+                # asyncio.TimeoutError and, if it persists, trips the breaker.
                 pdf_bytes = await resilient_call(
                     "document_download",
-                    lambda: scraper.download_document_generic(
+                    lambda: download_with_budget(
+                        scraper,
                         session=pjud_session,
                         endpoint=doc.pjud_endpoint,
                         doc_type=doc.doc_type or "resolution",
