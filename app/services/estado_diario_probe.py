@@ -175,10 +175,44 @@ def staleness_stats(
     )
 
 
+async def _fetch_via_fetch(page, fecha: str) -> dict:
+    """Same request as the `$.ajax` one, for pages that do not load jQuery.
+
+    Mirrors what `$.ajax` sends by default: form-encoded body and the
+    X-Requested-With header the server uses to tell an AJAX call apart from a
+    navigation. Same-origin with the session cookies, like the rest of the
+    in-page calls already do.
+    """
+    js = f"""
+        () => fetch({json.dumps(ENDPOINT)}, {{
+            method: 'POST',
+            credentials: 'include',
+            headers: {{
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest'
+            }},
+            body: 'fechaEstDiaCiv=' + encodeURIComponent({json.dumps(fecha)})
+        }})
+        .then(r => r.text().then(t => ({{status: r.status, body: t}})))
+        .catch(e => ({{status: 0, body: String(e)}}))
+    """
+    return await page.evaluate(js)
+
+
 async def fetch_estado_diario(page, fecha: str) -> dict:
     """Load the estado-diario page, then ONE in-page ``$.ajax`` POST from it
     (the same shape the listing uses)."""
     await page.goto(f"{PJUD_BASE_URL}{LOADER}", wait_until="domcontentloaded")
+
+    # Measured on the first real run (2026-10-14): `/miEstadoDiario.php` does
+    # NOT give us jQuery the way the Mis Causas panel does, and `$.ajax` blew
+    # up with "ReferenceError: $ is not defined". Prefer $.ajax when it IS
+    # there (it is the request shape Shape already tolerates on the listing)
+    # and fall back to fetch with the same headers and body encoding.
+    has_jquery = bool(await page.evaluate("() => typeof window.jQuery !== 'undefined'"))
+    if not has_jquery:
+        return await _fetch_via_fetch(page, fecha)
+
     js = f"""
         () => new Promise((resolve) => {{
             $.ajax({{
