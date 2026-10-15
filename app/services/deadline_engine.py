@@ -32,6 +32,7 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy.orm import Session
 
 import re as _re
+import unicodedata
 
 from app.core.deadlines_config import (
     ACTIONABLE_DEADLINE_VALUES,
@@ -45,6 +46,7 @@ from app.core.deadlines_config import (
 )
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
 from app.services.deadline_verdict import evaluate_deadline
@@ -150,6 +152,43 @@ def _compute_prescripcion(
     prescripcion_fecha = start + relativedelta(years=plazo_years)
     prescripcion_cumplida = prescripcion_fecha < today
     return (prescripcion_cumplida, prescripcion_fecha)
+
+
+# A REAL debtor opposition only. The previous broad regex (`excepci[oó]n`)
+# matched any mention ("plazo de excepciones", "admisibilidad de excep") and
+# wrongly blocked the rebeldía transition. ("Contestación Excepciones" is the
+# court's traslado resolution, the creditor's stage: NOT an opposition.)
+_OPPOSITION_STAGES = frozenset({"Excepciones", "Oposición de Excepciones"})
+_OPONE_EXCEPCIONES_RE = _re.compile(r"opone\s+excepciones", _re.IGNORECASE)
+# Who files an escrito for the ejecutado. Matched on whole words after
+# normalisation, so "Demandante" never matches.
+_DEMANDADO_SOLICITANTE_RE = _re.compile(r"\b(demandad[oa]s?|ejecutad[oa]s?)\b")
+
+
+def _is_opposition_movement(mv: Movement) -> bool:
+    return (mv.stage or "").strip() in _OPPOSITION_STAGES or bool(
+        _OPONE_EXCEPCIONES_RE.search(mv.description or "")
+    )
+
+
+def _normalize_text(value: Optional[str]) -> str:
+    """Lowercase, accent-free, single-spaced text for tolerant comparison."""
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(stripped.lower().split())
+
+
+def _is_demandado_opposition_escrito(escrito: CaseEscrito) -> bool:
+    """True for a dated escrito in which the ejecutado opposes the execution."""
+    return (
+        escrito.fecha_ingreso is not None
+        and bool(_OPONE_EXCEPCIONES_RE.search(_normalize_text(escrito.tipo_escrito)))
+        and bool(_DEMANDADO_SOLICITANTE_RE.search(_normalize_text(escrito.solicitante)))
+    )
+
+
+def _day_of(value: object) -> date:
+    return value.date() if isinstance(value, datetime) else value  # type: ignore[return-value]
 
 
 def _firm_side(db: Session, case: "Case") -> str:
@@ -335,6 +374,10 @@ class DeadlineEngine:
 
         # Step 4: upsert case_deadlines for each active trigger.
         new_trigger_keys: dict[str, date] = {}  # deadline_type → triggered_at
+        # The live, automatic excepciones row of this recompute (step 4 already
+        # holds it, so step 5d needs no extra round-trip). Stays None when the
+        # row is manual or already judged by the auditor.
+        excepciones_row: Optional[CaseDeadline] = None
 
         for deadline_type, trigger in triggers.items():
             triggered_at = cls._triggered_at_date(trigger)
@@ -374,7 +417,11 @@ class DeadlineEngine:
                     computed_at=datetime.now(timezone.utc),
                 )
                 db.add(row)
+                if deadline_type == DeadlineType.EXCEPCIONES_8D:
+                    excepciones_row = row
             else:
+                if deadline_type == DeadlineType.EXCEPCIONES_8D:
+                    excepciones_row = existing
                 existing.due_date = due_date
                 existing.status = "active"
                 existing.computed_at = datetime.now(timezone.utc)
@@ -455,6 +502,13 @@ class DeadlineEngine:
         cls._sync_parallel_deadlines(db, movements, today)
         db.flush()
 
+        # Step 5d: DEMANDADO. The firm's own filed opposition closes the plazo.
+        if side == "demandado" and excepciones_row is not None:
+            cls._close_excepciones_on_defense(
+                db, excepciones_row, movements, today
+            )
+            db.flush()
+
         # Step 6: REBELDÍA post-transition.
         # Only applies when the firm is DEMANDANTE (creditor): the debtor's
         # failure to oppose (EXCEPCIONES_8D lapsed) is a favourable outcome for
@@ -473,24 +527,9 @@ class DeadlineEngine:
                 )
                 .first()
             )
-            # A REAL opposition only — the previous broad regex (`excepci[oó]n`)
-            # matched any mention ("plazo de excepciones", "admisibilidad de
-            # excep") and wrongly blocked the rebeldía transition.
-            # Real debtor-opposition stages. ("Contestación Excepciones" is the
-            # court's traslado resolution — the firm's stage — NOT an opposition,
-            # so it is intentionally excluded here.)
-            _opposition_stages = {
-                "Excepciones",
-                "Oposición de Excepciones",
-            }
+            # A REAL opposition only (see _is_opposition_movement).
             has_excepciones_movement = any(
-                (mv.stage or "").strip() in _opposition_stages
-                or bool(_re.search(
-                    r"opone\s+excepciones",
-                    (mv.description or ""),
-                    _re.IGNORECASE,
-                ))
-                for mv in movements
+                _is_opposition_movement(mv) for mv in movements
             )
             if (
                 exc_row is not None
@@ -577,6 +616,52 @@ class DeadlineEngine:
         # less battle-tested) DecisionEngine must never break the deadline
         # computation that already succeeded.
         cls._recompute_decision(db, case, today, side=side)
+
+    @classmethod
+    def _close_excepciones_on_defense(
+        cls, db: Session, row: CaseDeadline, movements: list[Movement], today: date
+    ) -> None:
+        """DEMANDADO: a filed "Opone excepciones" fulfils the art. 464 plazo.
+
+        The evidence is the ``case_escritos`` row (the filing exists in our
+        data long before the court provee it as a movement); a movement that
+        shows the opposition is accepted as a fallback. Only a live, automatic
+        row is touched: manual rows and rows an auditor judged are never
+        overwritten (same guard as ``_record_verdict``).
+
+        * escrito dated on or before due_date  -> status ``cumplido``
+        * escrito dated after due_date         -> status ``no_cumplido`` (the
+          audit trail must say it was late). Both leave the active set, so
+          neither keeps the semáforo red: nothing is pending for the firm.
+        * movement-only evidence: its date is PJUD's PUBLICATION date, not the
+          filing date, so it can only prove ``cumplido``. When it is later than
+          due_date the row is closed as ``superseded`` and the (margin-aware)
+          verdict says what can honestly be claimed.
+        """
+        if row.is_manual or row.status != "active":
+            return
+        escritos = [
+            _day_of(e.fecha_ingreso)
+            for e in db.query(CaseEscrito).filter(CaseEscrito.case_id == row.case_id).all()
+            if _is_demandado_opposition_escrito(e)
+        ]
+        opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
+        if not escritos and not opposition_movements:
+            return
+
+        if escritos:
+            filed_on = min(escritos)
+            on_time = filed_on <= row.due_date
+            row.status = "cumplido" if on_time else "no_cumplido"
+            row.verdict = "cumplido" if on_time else "fuera_de_plazo"
+            row.verdict_movement_id = None
+            row.verdict_acted_on = filed_on
+            row.verdict_computed_at = datetime.now(timezone.utc)
+        else:
+            published_on = min(_day_of(mv.movement_date) for mv in opposition_movements)
+            row.status = "cumplido" if published_on <= row.due_date else "superseded"
+            cls._apply_verdict(row, movements, today)
+        row.computed_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:

@@ -316,6 +316,185 @@ class TestRebeldia:
 
 
 # ---------------------------------------------------------------------------
+# DEMANDADO: a filed "Opone excepciones" escrito closes the excepciones_8d plazo
+# ---------------------------------------------------------------------------
+
+
+def _add_escrito(
+    db,
+    case_id: int,
+    fecha: date | None,
+    tipo: str = "Opone excepciones",
+    solicitante: str = "Demandado",
+):
+    from app.models.case_escrito import CaseEscrito
+
+    row = CaseEscrito(
+        case_id=case_id,
+        fecha_ingreso=datetime.combine(fecha, datetime.min.time()) if fecha else None,
+        tipo_escrito=tipo,
+        solicitante=solicitante,
+        natural_key=f"esc-{case_id}-{tipo}-{solicitante}-{fecha}",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+class TestDemandadoEscritoClosesExcepciones:
+    """The firm defends the ejecutado. Its own opposition, filed as an escrito
+    (NOT yet a movement: the court provee it weeks later), fulfils the plazo."""
+
+    NOTIF = TODAY - timedelta(days=30)
+
+    @property
+    def due(self) -> date:
+        from app.services.business_days import add_business_days
+
+        return add_business_days(self.NOTIF, 8)
+
+    def _seed(self, db, *, side: str = "demandado") -> Case:
+        case = _make_case(db)
+        _set_side(db, case, side)
+        _add_movement(
+            db, case.id, self.NOTIF, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"
+        )
+        return case
+
+    @staticmethod
+    def _row(db, case) -> CaseDeadline:
+        return (
+            db.query(CaseDeadline)
+            .filter_by(case_id=case.id, deadline_type=DeadlineType.EXCEPCIONES_8D.value)
+            .one()
+        )
+
+    def test_escrito_on_time_marks_cumplido_and_clears_rojo(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due)  # last day of the plazo: still on time
+        _recompute(db, case)
+        row = self._row(db, case)
+        assert row.status == "cumplido"
+        assert row.verdict == "cumplido"
+        assert row.verdict_acted_on == self.due
+        assert case.semaforo != "rojo"
+
+    def test_escrito_after_due_date_marks_no_cumplido_and_clears_rojo(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due + timedelta(days=3))
+        _recompute(db, case)
+        row = self._row(db, case)
+        assert row.status == "no_cumplido"
+        assert row.verdict == "fuera_de_plazo"
+        assert case.semaforo != "rojo"
+
+    def test_case_and_whitespace_are_normalised(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(
+            db, case.id, self.due, tipo="  OPONE   EXCEPCIONES ",
+            solicitante="DEMANDADO",
+        )
+        _recompute(db, case)
+        assert self._row(db, case).status == "cumplido"
+
+    def test_no_escrito_overdue_stays_rojo(self, db) -> None:
+        """The most important guard: a really missed plazo keeps warning."""
+        case = self._seed(db)
+        _recompute(db, case)
+        assert self._row(db, case).status == "active"
+        assert case.semaforo == "rojo"
+
+    @pytest.mark.parametrize(
+        "tipo",
+        [
+            "Tenga presente",
+            "Acompaña documentos",
+            "Plazo de excepciones",
+            "Admisibilidad de excepciones",
+        ],
+    )
+    def test_other_escrito_types_do_not_close_the_plazo(self, db, tipo) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due, tipo=tipo)
+        _recompute(db, case)
+        assert self._row(db, case).status == "active"
+        assert case.semaforo == "rojo"
+
+    @pytest.mark.parametrize("solicitante", ["Demandante", "Ejecutante", "Tribunal"])
+    def test_escrito_not_from_the_demandado_does_not_close(self, db, solicitante) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due, solicitante=solicitante)
+        _recompute(db, case)
+        assert self._row(db, case).status == "active"
+        assert case.semaforo == "rojo"
+
+    def test_escrito_without_date_does_not_close(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, None)
+        _recompute(db, case)
+        assert self._row(db, case).status == "active"
+
+    def test_manual_row_is_never_overwritten(self, db) -> None:
+        from app.services.business_days import add_business_days
+
+        case = self._seed(db)
+        db.add(CaseDeadline(
+            case_id=case.id,
+            deadline_type=DeadlineType.EXCEPCIONES_8D.value,
+            due_date=add_business_days(self.NOTIF, 8),
+            triggered_at=self.NOTIF,
+            status="active",
+            is_manual=True,
+        ))
+        db.flush()
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        row = self._row(db, case)
+        assert row.status == "active"
+        assert row.verdict is None
+
+    def test_auditor_verdict_is_never_overwritten(self, db) -> None:
+        from app.services.business_days import add_business_days
+
+        case = self._seed(db)
+        db.add(CaseDeadline(
+            case_id=case.id,
+            deadline_type=DeadlineType.EXCEPCIONES_8D.value,
+            due_date=add_business_days(self.NOTIF, 8),
+            triggered_at=self.NOTIF,
+            status="no_cumplido",
+        ))
+        db.flush()
+        _add_escrito(db, case.id, self.due)  # on time, but the auditor said no
+        _recompute(db, case)
+        row = self._row(db, case)
+        assert row.status == "no_cumplido"
+        assert row.verdict is None
+
+    def test_recompute_is_idempotent(self, db) -> None:
+        case = self._seed(db)
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        first = (self._row(db, case).status, self._row(db, case).verdict, case.semaforo)
+        _recompute(db, case)
+        assert (self._row(db, case).status, self._row(db, case).verdict, case.semaforo) == first
+        assert (
+            db.query(CaseDeadline)
+            .filter_by(case_id=case.id, deadline_type=DeadlineType.EXCEPCIONES_8D.value)
+            .count()
+            == 1
+        )
+
+    def test_demandante_rebeldia_is_unchanged_by_an_escrito(self, db) -> None:
+        """Characterisation: the creditor branch keeps looking at movements only."""
+        case = self._seed(db, side="demandante")
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.REBELDE.value
+        assert self._row(db, case).status == "expired"
+
+
+# ---------------------------------------------------------------------------
 # Abandono / prescripción risk flags (REQ-4)
 # ---------------------------------------------------------------------------
 
