@@ -151,3 +151,38 @@ def test_manual_row_is_not_a_candidate(db, owner):
     db.flush()
 
     assert run(db, apply=True).candidates == 0
+
+
+def test_reanchored_row_reports_the_new_rows_verdict_not_superseded(db, owner):
+    """Population shape: the stored row has an OLD anchor, so the engine
+    supersedes it and judges a NEW row. The report must not count that as a
+    plain 'superseded' (it hid 20 of 41 closures in the QA dry-run)."""
+    case = _case(db, owner, "C-8-2026", escrito="Opone excepciones")
+    row = CaseDeadline(
+        case_id=case.id, deadline_type="excepciones_8d",
+        due_date=DUE - timedelta(days=4), triggered_at=NOTIF_DAY - timedelta(days=4),
+        status="active",
+    )
+    db.add(row)
+    case.semaforo = "rojo"
+    db.flush()
+
+    result = run(db, apply=True)
+
+    assert (result.to_cumplido, result.to_no_cumplido, result.other) == (1, 0, 0)
+    assert "superseded" in result.outcomes[0].rows_after
+    assert "cumplido" in result.outcomes[0].rows_after
+
+
+def test_state_advanced_case_with_on_time_defense_is_cumplido_not_superseded(db, owner):
+    case = _case(db, owner, "C-9-2026", escrito="Opone excepciones")
+    db.add(Movement(
+        case_id=case.id, stage="Gestión", procedure="Resolución",
+        description="Se pronuncia sobre admisibilidad",
+        movement_date=datetime.combine(NOTIF_DAY + timedelta(days=3), datetime.min.time()),
+    ))
+    _stale_active_row(db, case)
+
+    result = run(db, apply=True)
+
+    assert (result.to_cumplido, result.other) == (1, 0)

@@ -374,10 +374,6 @@ class DeadlineEngine:
 
         # Step 4: upsert case_deadlines for each active trigger.
         new_trigger_keys: dict[str, date] = {}  # deadline_type → triggered_at
-        # The live, automatic excepciones row of this recompute (step 4 already
-        # holds it, so step 5d needs no extra round-trip). Stays None when the
-        # row is manual or already judged by the auditor.
-        excepciones_row: Optional[CaseDeadline] = None
 
         for deadline_type, trigger in triggers.items():
             triggered_at = cls._triggered_at_date(trigger)
@@ -417,11 +413,7 @@ class DeadlineEngine:
                     computed_at=datetime.now(timezone.utc),
                 )
                 db.add(row)
-                if deadline_type == DeadlineType.EXCEPCIONES_8D:
-                    excepciones_row = row
             else:
-                if deadline_type == DeadlineType.EXCEPCIONES_8D:
-                    excepciones_row = existing
                 existing.due_date = due_date
                 existing.status = "active"
                 existing.computed_at = datetime.now(timezone.utc)
@@ -451,6 +443,21 @@ class DeadlineEngine:
         )
         for row in all_active:
             current_trigger = new_trigger_keys.get(row.deadline_type)
+            # DEMANDADO: a filed defense is judged FIRST. It must win over every
+            # supersession below (the case moved on, or later court activity),
+            # which would otherwise drop the plazo as "superseded" and lose the
+            # fact that the firm did (or did not) answer in time. A re-anchored
+            # row is left to its replacement: its due_date is stale.
+            re_anchored = (
+                current_trigger is not None and row.triggered_at != current_trigger
+            )
+            if (
+                side == "demandado"
+                and row.deadline_type == DeadlineType.EXCEPCIONES_8D.value
+                and not re_anchored
+                and cls._close_excepciones_on_defense(db, row, movements, today)
+            ):
+                continue
             if current_trigger is None:
                 # The plazo closed because the case moved on: judge it BEFORE
                 # superseding, or the evidence is lost with the row's status.
@@ -501,13 +508,6 @@ class DeadlineEngine:
         # model). Runs AFTER steps 5/5b so nothing above can touch these rows.
         cls._sync_parallel_deadlines(db, movements, today)
         db.flush()
-
-        # Step 5d: DEMANDADO. The firm's own filed opposition closes the plazo.
-        if side == "demandado" and excepciones_row is not None:
-            cls._close_excepciones_on_defense(
-                db, excepciones_row, movements, today
-            )
-            db.flush()
 
         # Step 6: REBELDÍA post-transition.
         # Only applies when the firm is DEMANDANTE (creditor): the debtor's
@@ -620,7 +620,7 @@ class DeadlineEngine:
     @classmethod
     def _close_excepciones_on_defense(
         cls, db: Session, row: CaseDeadline, movements: list[Movement], today: date
-    ) -> None:
+    ) -> bool:
         """DEMANDADO: a filed "Opone excepciones" fulfils the art. 464 plazo.
 
         The evidence is the ``case_escritos`` row (the filing exists in our
@@ -634,12 +634,12 @@ class DeadlineEngine:
           audit trail must say it was late). Both leave the active set, so
           neither keeps the semáforo red: nothing is pending for the firm.
         * movement-only evidence: its date is PJUD's PUBLICATION date, not the
-          filing date, so it can only prove ``cumplido``. When it is later than
-          due_date the row is closed as ``superseded`` and the (margin-aware)
-          verdict says what can honestly be claimed.
+          filing date, so it cannot prove on-time or late by itself. The row is
+          closed as ``superseded`` (the engine's long-standing treatment) and
+          the margin-aware verdict says what can honestly be claimed.
         """
         if row.is_manual or row.status != "active":
-            return
+            return False
         escritos = [
             _day_of(e.fecha_ingreso)
             for e in db.query(CaseEscrito).filter(CaseEscrito.case_id == row.case_id).all()
@@ -647,21 +647,26 @@ class DeadlineEngine:
         ]
         opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
         if not escritos and not opposition_movements:
-            return
+            return False
 
+        # Judged against the due_date the plazo SHOULD have (a stale row may
+        # still carry the pre-diligencia one); the row's own field is not edited.
+        due = cls._current_due_date(row)
         if escritos:
             filed_on = min(escritos)
-            on_time = filed_on <= row.due_date
+            on_time = filed_on <= due
             row.status = "cumplido" if on_time else "no_cumplido"
             row.verdict = "cumplido" if on_time else "fuera_de_plazo"
             row.verdict_movement_id = None
             row.verdict_acted_on = filed_on
             row.verdict_computed_at = datetime.now(timezone.utc)
         else:
-            published_on = min(_day_of(mv.movement_date) for mv in opposition_movements)
-            row.status = "cumplido" if published_on <= row.due_date else "superseded"
+            # Same closure the engine always gave a movement-shown opposition
+            # (superseded + margin-aware verdict).
+            row.status = "superseded"
             cls._apply_verdict(row, movements, today)
         row.computed_at = datetime.now(timezone.utc)
+        return True
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:

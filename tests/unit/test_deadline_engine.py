@@ -485,6 +485,79 @@ class TestDemandadoEscritoClosesExcepciones:
             == 1
         )
 
+    # -- The real population: a STALE active row, then the engine runs again. --
+    # In production the 41 rows were created by an earlier recompute and the
+    # case moved on afterwards, so the recompute does not see the ideal
+    # "fresh NOTIFICADO case" the tests above build.
+
+    def _stale_row(self, db, case, *, triggered_at=None, due=None) -> CaseDeadline:
+        row = CaseDeadline(
+            case_id=case.id,
+            deadline_type=DeadlineType.EXCEPCIONES_8D.value,
+            due_date=due or self.due,
+            triggered_at=triggered_at or self.NOTIF,
+            status="active",
+        )
+        db.add(row)
+        case.semaforo = "rojo"
+        db.flush()
+        return row
+
+    def test_court_activity_after_the_due_date_does_not_hide_an_on_time_defense(
+        self, db
+    ) -> None:
+        """Step 5b (overtaken) used to supersede the row before the defense was seen."""
+        case = self._seed(db)
+        row = self._stale_row(db, case)
+        _add_movement(db, case.id, self.due + timedelta(days=2), "Gestión", "Resolución cualquiera")
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        db.refresh(row)
+        assert row.status == "cumplido"
+        assert case.semaforo != "rojo"
+
+    def test_late_defense_with_later_court_activity_is_no_cumplido(self, db) -> None:
+        case = self._seed(db)
+        row = self._stale_row(db, case)
+        _add_movement(db, case.id, self.due + timedelta(days=9), "Gestión", "Resolución cualquiera")
+        _add_escrito(db, case.id, self.due + timedelta(days=3))
+        _recompute(db, case)
+        db.refresh(row)
+        assert row.status == "no_cumplido"
+
+    def test_state_advance_without_an_opposition_movement_keeps_the_defense_verdict(
+        self, db
+    ) -> None:
+        """The classifier drops the trigger when the case advances (step 5)."""
+        case = self._seed(db)
+        row = self._stale_row(db, case)
+        _add_movement(
+            db, case.id, self.NOTIF + timedelta(days=3), "Gestión",
+            "Se pronuncia sobre admisibilidad",
+        )
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        db.refresh(row)
+        assert row.status == "cumplido"
+
+    def test_reanchored_stale_row_is_superseded_and_the_new_row_is_judged(self, db) -> None:
+        case = self._seed(db)
+        old = self._stale_row(
+            db, case, triggered_at=self.NOTIF - timedelta(days=4),
+            due=self.due - timedelta(days=4),
+        )
+        _add_escrito(db, case.id, self.due)
+        _recompute(db, case)
+        db.refresh(old)
+        rows = (
+            db.query(CaseDeadline)
+            .filter_by(case_id=case.id, deadline_type=DeadlineType.EXCEPCIONES_8D.value)
+            .all()
+        )
+        assert old.status == "superseded"
+        assert sorted(r.status for r in rows) == ["cumplido", "superseded"]
+        assert case.semaforo != "rojo"
+
     def test_demandante_rebeldia_is_unchanged_by_an_escrito(self, db) -> None:
         """Characterisation: the creditor branch keeps looking at movements only."""
         case = self._seed(db, side="demandante")

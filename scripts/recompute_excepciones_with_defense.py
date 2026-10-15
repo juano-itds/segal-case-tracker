@@ -40,12 +40,14 @@ def _report(result) -> None:
         print(
             f"  case {o.case_id:<7} {o.rol or '-':<16} due {o.due_date}  "
             f"{o.old_status} -> {o.new_status}   semaforo {o.old_semaforo} -> {o.new_semaforo}"
+            f"\n      rows after: {o.rows_after}"
         )
 
     print("\n=== summary ===")
     print(f"  -> cumplido (defense on time):      {result.to_cumplido}")
     print(f"  -> no_cumplido (defense was late):  {result.to_no_cumplido}")
-    print(f"  unchanged:                          {result.unchanged}")
+    print(f"  closed some other way (superseded): {result.other}")
+    print(f"  unchanged (still active):           {result.unchanged}")
     print(f"  red semaforo cleared:               {result.rojo_cleared}")
     if result.failed:
         print(f"  failed case ids: {result.failed}")

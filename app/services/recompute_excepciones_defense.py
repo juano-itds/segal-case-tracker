@@ -59,6 +59,10 @@ class CaseOutcome:
     due_date: date
     old_semaforo: Optional[str]
     new_semaforo: Optional[str]
+    # Every excepciones_8d row of the case AFTER the recompute, e.g.
+    # "#10:superseded@2026-06-12 #55:cumplido@2026-06-16". Makes a re-anchored
+    # case (old row superseded, new row judged) readable at a glance.
+    rows_after: str = ""
 
 
 @dataclass
@@ -80,6 +84,10 @@ class Result:
     @property
     def unchanged(self) -> int:
         return sum(1 for o in self.outcomes if o.new_status == o.old_status)
+
+    @property
+    def other(self) -> int:
+        return len(self.outcomes) - self.to_cumplido - self.to_no_cumplido - self.unchanged
 
     @property
     def rojo_cleared(self) -> int:
@@ -163,16 +171,37 @@ def run(db: Session, *, apply: bool = False) -> Result:
             if savepoint is not None:
                 savepoint.commit()
 
+            all_rows = (
+                db.query(CaseDeadline)
+                .filter(CaseDeadline.case_id == case_id, CaseDeadline.deadline_type == _TYPE)
+                .order_by(CaseDeadline.id)
+                .all()
+            )
+            before_ids = {rid for (rid, _, _) in before}
+            # The engine re-anchors a stale row: it supersedes it and judges a
+            # NEW row. The case's outcome is the new row's verdict, not the
+            # old row's "superseded".
+            judged_new = [
+                r for r in all_rows
+                if r.id not in before_ids and r.status in ("cumplido", "no_cumplido")
+            ]
+            rows_after = " ".join(
+                f"#{r.id}:{r.status}@{r.triggered_at}" for r in all_rows
+            )
             for (row_id, old_status, due) in before:
                 row = db.get(CaseDeadline, row_id)
+                new_status = row.status if row is not None else old_status
+                if new_status == "superseded" and judged_new:
+                    new_status = judged_new[0].status
                 result.outcomes.append(CaseOutcome(
                     case_id=case_id,
                     rol=case.rol,
                     old_status=old_status,
-                    new_status=row.status if row is not None else old_status,
+                    new_status=new_status,
                     due_date=due,
                     old_semaforo=old_semaforo,
                     new_semaforo=case.semaforo,
+                    rows_after=rows_after,
                 ))
         if apply:
             db.commit()
