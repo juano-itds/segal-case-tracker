@@ -62,8 +62,9 @@ ENDPOINT = "/miEstadoDiario/civil/estadoDiarioFechaCivil.php"
 # capture of this endpoint recorded this loader as part of the flow. POSTing
 # cold from whatever page the detail phase left behind risks a rejection we
 # would read as "the endpoint is dead" -- and this feed was already written
-# off once by mistake, for three months. Navigating costs nothing here: the
-# browser is torn down between lawyers anyway.
+# off once by mistake, for three months. Navigating leaves the page off the
+# Mis Causas panel; the cycle runs the probe before the detail phase, which
+# re-loads the panel by itself (``_ensure_panel_loaded``) before its first fetch.
 LOADER = "/miEstadoDiario.php"
 _BOUNCE_STATUSES = (401, 403)
 
