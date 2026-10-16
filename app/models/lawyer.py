@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, text
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Date, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -67,6 +67,12 @@ class Lawyer(Base):
     # episode). Cleared to NULL the next time this lawyer's login succeeds,
     # so a future credential change alerts again.
     credential_alert_sent_at = Column(DateTime, nullable=True)
+
+    # Last business day (Mon-Fri, no feriados) whose OJV estado-diario feed was
+    # read successfully for this lawyer. The probe asks for every business day
+    # after it, so a skipped cycle does not lose a day of notifications. NULL =
+    # never read (the probe then asks for the previous business day only).
+    estado_diario_last_read_on = Column(Date, nullable=True)
     
     # Relationships
     # Case now has two FKs to lawyers (lawyer_id + the asignación-por-nivel

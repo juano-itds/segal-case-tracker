@@ -102,6 +102,24 @@ def previous_business_day(d: date, *, include_saturday: bool = True) -> date:
     return current
 
 
+def business_days_after(
+    after: date, upto: date, *, include_saturday: bool = True
+) -> list[date]:
+    """Return the días hábiles in the half-open range ``(after, upto]``, ascending.
+
+    Same notion of hábil as ``previous_business_day`` (``include_saturday=False``
+    for feeds the courts publish Monday to Friday only). Empty when
+    ``upto <= after``.
+    """
+    out: list[date] = []
+    current = after + timedelta(days=1)
+    while current <= upto:
+        if _is_business_day(current) and (include_saturday or current.weekday() != 5):
+            out.append(current)
+        current += timedelta(days=1)
+    return out
+
+
 def count_business_days_remaining(due_date: date, today: date) -> int:
     """Count business days between *today* and *due_date*.
 

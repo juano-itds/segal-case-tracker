@@ -37,13 +37,14 @@ from app.config import settings
 from app.core.database import SessionLocal
 from app.models.case import Case
 from app.models.court import Court
+from app.models.lawyer import Lawyer
 from app.scrapper.pjud.base import (
     _DETAIL_SESSION_URL_MARKERS,
     classify_small_detail_modal,
     detect_shape_challenge,
 )
 from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
-from app.services.business_days import previous_business_day
+from app.services.business_days import business_days_after, previous_business_day
 from app.services.shape_cooldown import get_shape_cooldown
 
 logger = logging.getLogger("estado_diario_probe")
@@ -328,10 +329,15 @@ async def _fetch_via_fetch(page, fecha: str) -> dict:
     return await page.evaluate(js)
 
 
-async def fetch_estado_diario(page, fecha: str) -> dict:
+async def fetch_estado_diario(page, fecha: str, *, navigate: bool = True) -> dict:
     """Load the estado-diario page, then ONE in-page ``$.ajax`` POST from it
-    (the same shape the listing uses)."""
-    await page.goto(f"{PJUD_BASE_URL}{LOADER}", wait_until="domcontentloaded")
+    (the same shape the listing uses).
+
+    ``navigate=False`` skips the page load for the 2nd..Nth day of a range: the
+    page is already the loader, and re-navigating would double the requests.
+    """
+    if navigate:
+        await page.goto(f"{PJUD_BASE_URL}{LOADER}", wait_until="domcontentloaded")
 
     # Measured on the first real run (2026-10-14): `/miEstadoDiario.php` does
     # NOT give us jQuery the way the Mis Causas panel does, and `$.ajax` blew
@@ -392,6 +398,52 @@ def _fmt(value) -> str:
     return "n/a" if value is None else str(value)
 
 
+def days_to_read(
+    last_read: Optional[date], latest: date, max_days: int
+) -> List[date]:
+    """Business days (Mon-Fri, no feriados) one probe should request, oldest first.
+
+    * never read          -> just ``latest`` (no month of history on first run)
+    * read up to ``latest`` -> ``latest`` again: the delta-sync re-reads the
+      newest day every cycle until its causas are consumed
+    * otherwise           -> every business day after ``last_read``, capped at
+      ``max_days`` keeping the OLDEST ones, so the watermark moves contiguously
+      and a long absence is caught up over several cycles with no hole.
+    """
+    if last_read is None:
+        return [latest]
+    days = business_days_after(last_read, latest, include_saturday=False)
+    if not days:
+        return [latest]
+    return days[: max(1, max_days)]
+
+
+def _load_watermark(session_factory: Callable, lawyer_id) -> Optional[date]:
+    db = session_factory()
+    try:
+        return (
+            db.query(Lawyer.estado_diario_last_read_on)
+            .filter(Lawyer.id == lawyer_id)
+            .scalar()
+        )
+    finally:
+        db.close()
+
+
+def _save_watermark(session_factory: Callable, lawyer_id, day: date) -> None:
+    db = session_factory()
+    try:
+        db.query(Lawyer).filter(Lawyer.id == lawyer_id).update(
+            {Lawyer.estado_diario_last_read_on: day}, synchronize_session=False
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 async def run_estado_diario_probe(
     *,
     scraper,
@@ -401,12 +453,18 @@ async def run_estado_diario_probe(
     now: Optional[datetime] = None,
     session_factory: Callable = SessionLocal,
 ) -> List[FeedRow]:
-    """Probe once, log once, and hand back the feed rows.
+    """Probe the business days since this lawyer's last successful read.
 
-    Never raises. Returns ``[]`` whenever there is nothing usable: flag off,
-    non-civil, no live page, no activity, bounced, endpoint changed or our own
-    failure. The rows are returned as soon as the response classifies as ``ok``,
-    so a failure in the log statistics that follow does not lose them.
+    Logs one line (plus samples) per day and hands back the rows of every day
+    read. Never raises. Returns ``[]`` whenever there is nothing usable: flag
+    off, non-civil, cooldown, no live page, no activity, bounced, endpoint
+    changed or our own failure.
+
+    A day counts as read only when its response classified as ``ok`` or
+    ``no_activity``; the watermark advances day by day and the range stops at
+    the first day that does not, so that day is asked again next cycle. The
+    range also stops, without another request, as soon as the Shape cooldown
+    is active.
     """
     if not settings.ESTADO_DIARIO_PROBE_ENABLED:
         return []
@@ -418,57 +476,97 @@ async def run_estado_diario_probe(
     # is challenging the station nothing may navigate, and the probe runs BEFORE
     # that phase, so it cannot rely on the detail phase's own abstention.
     cooldown = get_shape_cooldown()
-    if cooldown.active():
+
+    def _log_cooldown() -> None:
         logger.info(
             "ESTADO_DIARIO_PROBE lawyer=%s outcome=%s reason=shape_cooldown "
             "remaining_s=%.0f",
             lawyer_id, SKIPPED, cooldown.remaining(),
         )
+
+    if cooldown.active():
+        _log_cooldown()
         return []
     try:
-        target = previous_business_day(today or date.today(), include_saturday=False)
-        fecha = target.strftime("%d/%m/%Y")
+        latest = previous_business_day(today or date.today(), include_saturday=False)
+        try:
+            last_read = _load_watermark(session_factory, lawyer_id)
+        except Exception:  # noqa: BLE001 — no watermark: behave like a first run
+            logger.warning(
+                "ESTADO_DIARIO_PROBE lawyer=%s watermark unreadable; asking one day",
+                lawyer_id, exc_info=True,
+            )
+            last_read = None
+        targets = days_to_read(
+            last_read, latest, settings.ESTADO_DIARIO_MAX_DAYS_PER_CYCLE
+        )
 
         page = scraper.live_page()
         if page is None:
+            fecha = targets[0].strftime("%d/%m/%Y")
             logger.info(
                 "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s reason=no_live_page",
                 lawyer_id, fecha, SKIPPED,
             )
             return []
 
-        await pjud_action_limiter("estado_diario").acquire()
-        await asyncio.sleep(settings.DETAIL_FETCH_DELAY)
-        result = classify_response(await fetch_estado_diario(page, fecha))
+        for index, target in enumerate(targets):
+            if index and cooldown.active():
+                # Shape started challenging mid-range: stop asking. The days left
+                # are not marked read, so they are requested again later.
+                _log_cooldown()
+                break
+            fecha = target.strftime("%d/%m/%Y")
+            await pjud_action_limiter("estado_diario").acquire()
+            await asyncio.sleep(settings.DETAIL_FETCH_DELAY)
+            result = classify_response(
+                await fetch_estado_diario(page, fecha, navigate=index == 0)
+            )
 
-        if result.outcome == OK:
-            rows = list(result.rows)
-            stats = staleness_stats(
-                session_factory, result.rows, now or datetime.utcnow(), lawyer_id
-            )
-            # Sample lines go first so the counters line stays the last one of
-            # the probe for this lawyer, as before.
-            _log_samples(lawyer_id, fecha, stats)
-            # Existing keys keep their names and order (a script parses this
-            # line); new keys are only appended.
-            logger.info(
-                "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s rows=%d in_db=%d "
-                "not_in_db=%d never_checked=%d age_days_median=%s age_days_max=%s "
-                "other_lawyer=%d court_mismatch=%d court_unknown=%d",
-                lawyer_id, fecha, OK, len(result.rows), stats.in_db, stats.not_in_db,
-                stats.never_checked, _fmt(stats.median_days), _fmt(stats.max_days),
-                stats.other_lawyer, stats.court_mismatch, stats.court_unknown,
-            )
-        elif result.outcome == NO_ACTIVITY:
-            logger.info(
-                "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s rows=0",
-                lawyer_id, fecha, NO_ACTIVITY,
-            )
-        else:
-            logger.warning(
-                "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s status=%s detail=%s",
-                lawyer_id, fecha, result.outcome, _fmt(result.status), result.detail,
-            )
+            if result.outcome == OK:
+                rows.extend(result.rows)  # first: nothing below may lose them
+            if result.outcome in (OK, NO_ACTIVITY):
+                # Read: remember it before the statistics, which are only logging.
+                try:
+                    _save_watermark(session_factory, lawyer_id, target)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s "
+                        "error=watermark_not_saved %s: %s",
+                        lawyer_id, fecha, PROBE_ERROR, type(exc).__name__, exc,
+                    )
+                    break  # cannot advance contiguously: ask the rest again
+
+            if result.outcome == OK:
+                stats = staleness_stats(
+                    session_factory, result.rows, now or datetime.utcnow(), lawyer_id
+                )
+                # Sample lines go first so the counters line stays the last one of
+                # the probe for this lawyer-day, as before.
+                _log_samples(lawyer_id, fecha, stats)
+                # Existing keys keep their names and order (a script parses this
+                # line); new keys are only appended.
+                logger.info(
+                    "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s rows=%d in_db=%d "
+                    "not_in_db=%d never_checked=%d age_days_median=%s age_days_max=%s "
+                    "other_lawyer=%d court_mismatch=%d court_unknown=%d",
+                    lawyer_id, fecha, OK, len(result.rows), stats.in_db,
+                    stats.not_in_db, stats.never_checked, _fmt(stats.median_days),
+                    _fmt(stats.max_days), stats.other_lawyer, stats.court_mismatch,
+                    stats.court_unknown,
+                )
+            elif result.outcome == NO_ACTIVITY:
+                logger.info(
+                    "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s rows=0",
+                    lawyer_id, fecha, NO_ACTIVITY,
+                )
+            else:
+                logger.warning(
+                    "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s status=%s detail=%s",
+                    lawyer_id, fecha, result.outcome, _fmt(result.status),
+                    result.detail,
+                )
+                break  # not read: this day and the ones after it wait for next cycle
     except Exception as exc:  # noqa: BLE001 — a probe failure never breaks the cycle
         logger.warning(
             "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s error=%s: %s",

@@ -117,7 +117,7 @@ Y `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
 - [x] **T2** — La selección de rotación acepta un conjunto de ROL prioritarios
       con tope y piso. Flag apagado por defecto.
 - [ ] **T3** — Medición: comparar la demora antes y después sobre datos reales.
-- [ ] **T4** — El sondeo pide el rango de días hábiles desde la última lectura
+- [x] **T4** — El sondeo pide el rango de días hábiles desde la última lectura
       exitosa de ese abogado, no solo el día hábil anterior, para que un ciclo
       salteado no deje un agujero silencioso. Hace falta recordar por abogado
       cuándo fue la última lectura exitosa del feed (hoy no se persiste nada del
@@ -159,6 +159,34 @@ Hallazgos al leer el código:
   del mismo abogado también se prioriza (bug de identidad conocido).
 - `DETAIL_FEED_MAX_PER_BATCH >= DETAIL_BATCH_SIZE` anula el piso (el piso es
   derivado: `batch - tope`).
+
+**T4 hecha (2026-10-16).** El sondeo pide los dias habiles (lun-vie, sin
+feriados) desde la ultima lectura exitosa del abogado. Variable del tope:
+`ESTADO_DIARIO_MAX_DAYS_PER_CYCLE` (default 3, minimo 1). Persistencia: columna
+`lawyers.estado_diario_last_read_on` (DATE, nullable), migracion 069.
+
+Hallazgos al leer el codigo:
+
+- Siempre se vuelve a pedir el ultimo dia habil aunque ya este leido: el
+  delta-sync depende de releer el feed cada ciclo hasta consumirlo (T2). Un
+  watermark que evitara esa peticion dejaria al feed vacio en los ciclos
+  siguientes del dia.
+- El tope se aplica OLDEST FIRST: el watermark avanza contiguo y una ausencia
+  larga se pone al dia en varios ciclos, sin huecos. Costo: con una brecha mayor
+  que el tope, el dia mas reciente espera.
+- Un dia cuenta como leido con `ok` o `no_activity`. Cualquier otro resultado
+  (bounced, endpoint_changed, error) corta el rango y ese dia y los siguientes se
+  piden de nuevo. Si no se puede guardar el watermark tambien se corta.
+- Dias 2..N no navegan a `/miEstadoDiario.php` otra vez (la pagina ya esta
+  cargada): 1 navegacion + N POST, no N de cada una.
+- El cooldown se revisa antes de cada dia despues del primero. El sondeo NO
+  dispara el cooldown cuando ve un desafio Shape (clasifica `bounced`); solo corta.
+- Limite que T4 no resuelve: las filas de dias anteriores a ayer se leen UNA vez
+  (el watermark ya avanzo). Si superan el tope del feed (`DETAIL_FEED_MAX_PER_BATCH`)
+  en ese ciclo, el resto no se vuelve a pedir por el feed. T4 garantiza que el dia
+  se pidio, no que todas sus causas se scrapearon.
+- El proyecto si tiene calendario de feriados (`app/services/business_days.py`,
+  libreria `holidays`, CL): se reutiliza con `business_days_after`.
 
 ## Pendientes conocidos, fuera de esta feature
 
