@@ -63,6 +63,9 @@ class CaseOutcome:
     # "#10:superseded@2026-06-12 #55:cumplido@2026-06-16". Makes a re-anchored
     # case (old row superseded, new row judged) readable at a glance.
     rows_after: str = ""
+    # Compliance axis (Case.plazo_fatal_incumplido) before / after the recompute.
+    old_fatal_flag: bool = False
+    new_fatal_flag: bool = False
 
 
 @dataclass
@@ -88,6 +91,14 @@ class Result:
     @property
     def other(self) -> int:
         return len(self.outcomes) - self.to_cumplido - self.to_no_cumplido - self.unchanged
+
+    @property
+    def to_fatal_flagged(self) -> int:
+        """Distinct cases newly marked plazo_fatal_incumplido."""
+        return len({
+            o.case_id for o in self.outcomes
+            if o.new_fatal_flag and not o.old_fatal_flag
+        })
 
     @property
     def rojo_cleared(self) -> int:
@@ -155,6 +166,7 @@ def run(db: Session, *, apply: bool = False) -> Result:
             rows = _live_rows(db, case_id)
             before = [(r.id, r.status, r.due_date) for r in rows]
             old_semaforo = case.semaforo
+            old_fatal_flag = bool(case.plazo_fatal_incumplido)
 
             # The savepoint only matters when persisting. A dry-run relies on
             # the plain end-of-chunk rollback instead: releasing a savepoint
@@ -202,6 +214,8 @@ def run(db: Session, *, apply: bool = False) -> Result:
                     old_semaforo=old_semaforo,
                     new_semaforo=case.semaforo,
                     rows_after=rows_after,
+                    old_fatal_flag=old_fatal_flag,
+                    new_fatal_flag=bool(case.plazo_fatal_incumplido),
                 ))
         if apply:
             db.commit()

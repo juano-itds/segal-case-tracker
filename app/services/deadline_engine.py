@@ -36,6 +36,7 @@ import unicodedata
 
 from app.core.deadlines_config import (
     ACTIONABLE_DEADLINE_VALUES,
+    FATAL_DEADLINE_VALUES,
     DEADLINE_DISCLAIMER,
     DeadlineType,
     MANDATORY_ACTIONABLE_VALUES,
@@ -583,15 +584,28 @@ class DeadlineEngine:
         # a past-due OPTIONAL window (closed) — otherwise a VERDE case (e.g.
         # SENTENCIA with the apelación window already closed) would surface a
         # stale past date.
-        active_actionable = (
+        #
+        # ONE query serves both outputs (every statement is a Cloud SQL
+        # round-trip, see tests/services/test_roundtrips_per_case.py): the
+        # active rows drive next_deadline_at, the no_cumplido ones drive the
+        # compliance flag.
+        actionable_rows = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case.id,
-                CaseDeadline.status == "active",
+                CaseDeadline.status.in_(("active", "no_cumplido")),
                 CaseDeadline.deadline_type.in_(actionable_values),
             )
             .order_by(CaseDeadline.due_date.asc())
             .all()
+        )
+        active_actionable = [r for r in actionable_rows if r.status == "active"]
+        # Compliance axis: a lost FATAL plazo leaves the active set, so the
+        # semáforo cannot show it; this flag keeps it visible. Recomputed every
+        # time (never accumulated): an auditor correcting the row clears it.
+        case.plazo_fatal_incumplido = any(
+            r.status == "no_cumplido" and r.deadline_type in FATAL_DEADLINE_VALUES
+            for r in actionable_rows
         )
         case.next_deadline_at = None
         case.next_deadline_fatal = False
@@ -1065,6 +1079,7 @@ class DeadlineEngine:
         case.abandono_disponible = False
         case.next_deadline_fatal = False
         case.prescripcion_cumplida = False
+        case.plazo_fatal_incumplido = False
         case.prescripcion_fecha = None
         case.recommended_action_code = None
         case.next_review_at = None

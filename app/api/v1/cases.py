@@ -81,6 +81,8 @@ class CaseResponse(BaseModel):
     titulo_tipo: Optional[str] = None
     titulo_fecha: Optional[date] = None
     prescripcion_cumplida: bool = False
+    # Compliance axis: a FATAL plazo of the firm was lost (see DeadlineEngine).
+    plazo_fatal_incumplido: bool = False
     prescripcion_fecha: Optional[date] = None
     # Sysgal cobertura (derived from the demandado's cached commercial state).
     # Populated ONLY for cases in abandono/apremio/prescripción that have a
@@ -565,6 +567,14 @@ async def list_cases(
             "(reassigned), false = not reassigned (effective lawyer = lawyer_id)."
         ),
     ),
+    incumplido: Optional[bool] = Query(
+        None,
+        description=(
+            "Filter by plazo_fatal_incumplido: true = only cases where the firm "
+            "lost an actionable fatal deadline, false = only the rest. Does not "
+            "depend on next_deadline_at."
+        ),
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -649,6 +659,13 @@ async def list_cases(
         query = query.filter(Case.assigned_lawyer_id.isnot(None))
     elif asignado is False:
         query = query.filter(Case.assigned_lawyer_id.is_(None))
+
+    # Lost-fatal-deadline filter. Reads the flag column only, never
+    # next_deadline_at: a flagged case usually has no upcoming deadline.
+    if incumplido is True:
+        query = query.filter(Case.plazo_fatal_incumplido.is_(True))
+    elif incumplido is False:
+        query = query.filter(Case.plazo_fatal_incumplido.is_(False))
 
     # Get total count
     total = query.count()
@@ -737,6 +754,7 @@ async def list_cases(
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
             prescripcion_cumplida=case.prescripcion_cumplida or False,
+            plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
             matriz=case.matriz,
             matriz_etapa=case.matriz_etapa,
             matriz_origen=case.matriz_origen,
@@ -916,6 +934,7 @@ async def get_case(
         next_deadline_fatal=case.next_deadline_fatal or False,
         en_apremio=case.en_apremio or False,
         prescripcion_cumplida=case.prescripcion_cumplida or False,
+        plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
         matriz=case.matriz,
         matriz_etapa=case.matriz_etapa,
         matriz_origen=case.matriz_origen,

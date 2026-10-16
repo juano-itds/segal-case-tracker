@@ -174,6 +174,11 @@ PARALLEL_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in PARALLEL_D
 MANDATORY_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in MANDATORY_ACTIONABLE)
 OPTIONAL_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in OPTIONAL_ACTIONABLE)
 ACTIONABLE_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in ACTIONABLE_DEADLINES)
+# Plazos whose loss is irreparable. NOTE: some fatal types (excepciones_8d) are
+# only actionable for ONE side, so "actionable and fatal" must be evaluated
+# against the per-side ``actionable_sets``, never against the global
+# ACTIONABLE_DEADLINE_VALUES (which is the demandante view).
+FATAL_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in DeadlineType if d.is_fatal)
 
 
 def actionable_sets(side: str) -> "tuple[frozenset[str], frozenset[str]]":
