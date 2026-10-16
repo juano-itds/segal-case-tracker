@@ -232,6 +232,13 @@ class Settings(BaseSettings):
     # cycle, one log line, no effect on what the sync scrapes or alerts.
     # OFF by default: flip it in the environment to kill it without a deploy.
     ESTADO_DIARIO_PROBE_ENABLED: bool = False
+    # Max business days of the estado-diario feed one probe may request per
+    # lawyer per cycle. The probe asks for every business day since the last
+    # successful read (so a cycle skipped by the freshness guard leaves no hole),
+    # oldest first; each day is a PJUD request, so a lawyer who was away for
+    # weeks catches up over several cycles instead of in one burst. Env var,
+    # tunable without a deploy.
+    ESTADO_DIARIO_MAX_DAYS_PER_CYCLE: int = Field(default=3, ge=1)
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut

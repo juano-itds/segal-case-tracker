@@ -825,3 +825,280 @@ class TestShapeCooldown:
         page = _page(_resp(_table([])))
         await _run(_scraper(page), db)
         page.goto.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Range of business days since the last successful read (T4)
+# ---------------------------------------------------------------------------
+# The probe runs inside sync_lawyer_cases, which the freshness guard can skip
+# (measured 2026-10-16: 20 of 25 lawyers skipped in one cycle). Asking only for
+# the previous business day meant a skipped cycle lost that day's feed for good.
+
+import re  # noqa: E402
+
+from app.models.lawyer import Lawyer as _Lawyer  # noqa: E402,F401
+
+
+def _dates_in(js: str) -> str | None:
+    m = re.search(r"\d{2}/\d{2}/\d{4}", js)
+    return m.group(0) if m else None
+
+
+def _ddmm(d: date) -> str:
+    return d.strftime("%d/%m/%Y")
+
+
+def _day_page(by_date: dict, default=None, on_post=None):
+    """Page whose estado-diario answer depends on the requested date.
+
+    ``by_date`` maps ``dd/mm/YYYY`` -> response dict (or an Exception to raise).
+    The local jQuery check answers True and costs no request.
+    """
+    posted: list[str] = []
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.goto = AsyncMock()
+
+    async def evaluate(js, *a, **k):
+        if "estadoDiarioFechaCivil.php" not in js:
+            return True
+        fecha = _dates_in(js)
+        posted.append(fecha)
+        if on_post is not None:
+            on_post(fecha)
+        resp = by_date.get(fecha, default if default is not None else _resp(_table([])))
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+    page.evaluate = evaluate
+    page.posted = posted
+    return page
+
+
+def _watermark(db, lawyer) -> date | None:
+    db.expire_all()
+    return db.query(Lawyer).filter(Lawyer.id == lawyer.id).one().estado_diario_last_read_on
+
+
+async def _run_range(scraper, db, lawyer):
+    return await probe.run_estado_diario_probe(
+        scraper=scraper, lawyer_id=lawyer.id, competencia="civil",
+        today=TODAY, now=NOW, session_factory=lambda: db,
+    )
+
+
+# TODAY = Wed 2026-10-14. Mon 12/10 is a feriado (Encuentro de Dos Mundos).
+LAST_READ = date(2026, 10, 7)  # Wed
+EXPECTED_3 = ["08/10/2026", "09/10/2026", "13/10/2026"]  # skips Sat/Sun and the feriado
+
+
+class TestBusinessDayRange:
+    @pytest.mark.asyncio
+    async def test_no_previous_read_asks_for_one_day_like_before(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+        assert page.posted == ["13/10/2026"]
+
+    @pytest.mark.asyncio
+    async def test_three_business_days_since_last_read_asks_for_those_three(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+        assert page.posted == EXPECTED_3
+
+    @pytest.mark.asyncio
+    async def test_success_advances_the_watermark_to_the_last_day_read(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        await _run_range(_scraper(_day_page({})), db, lawyer)
+        assert _watermark(db, lawyer) == date(2026, 10, 13)
+
+    @pytest.mark.asyncio
+    async def test_already_up_to_date_still_asks_for_the_latest_day(
+        self, monkeypatch, limiter, db, log
+    ):
+        """The delta-sync re-reads the latest day every cycle until its causas
+        are consumed; a watermark must not turn that into zero requests."""
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = date(2026, 10, 13)
+        db.commit()
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+        assert page.posted == ["13/10/2026"]
+        assert _watermark(db, lawyer) == date(2026, 10, 13)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_day_is_not_marked_read_and_is_asked_again(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        # 08/10 ok, 09/10 bounced -> the range stops there
+        page = _day_page({"09/10/2026": _resp(LOGIN_PAGE)})
+        await _run_range(_scraper(page), db, lawyer)
+        assert page.posted == ["08/10/2026", "09/10/2026"]
+        assert _watermark(db, lawyer) == date(2026, 10, 8)  # NOT 09/10 nor 13/10
+
+        # next cycle: the failed day (and the ones after it) are requested again
+        page2 = _day_page({})
+        await _run_range(_scraper(page2), db, lawyer)
+        assert page2.posted == ["09/10/2026", "13/10/2026"]
+        assert _watermark(db, lawyer) == date(2026, 10, 13)
+
+    @pytest.mark.asyncio
+    async def test_a_day_that_raises_is_not_marked_read(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        page = _day_page({"08/10/2026": RuntimeError("boom")})
+        await _run_range(_scraper(page), db, lawyer)
+        assert page.posted == ["08/10/2026"]
+        assert _watermark(db, lawyer) == LAST_READ
+
+    @pytest.mark.asyncio
+    async def test_a_day_with_no_activity_counts_as_read(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        db.commit()
+        await _run_range(_scraper(_day_page({})), db, lawyer)  # empty tbody
+        assert _watermark(db, lawyer) == date(2026, 10, 13)
+
+    @pytest.mark.asyncio
+    async def test_cap_limits_requests_for_a_long_gap_oldest_first(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        monkeypatch.setattr(probe.settings, "ESTADO_DIARIO_MAX_DAYS_PER_CYCLE", 3)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = TODAY - timedelta(days=40)
+        db.commit()
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+        assert len(page.posted) == 3
+        # oldest first, so the watermark keeps moving contiguously and no
+        # day is skipped over
+        days = [datetime.strptime(p, "%d/%m/%Y").date() for p in page.posted]
+        assert days == sorted(days)
+        assert _watermark(db, lawyer) == days[-1]
+        assert days[0] > TODAY - timedelta(days=40)
+
+    def test_cap_default_is_conservative_and_env_driven(self):
+        from app.config import Settings
+        field = Settings.model_fields["ESTADO_DIARIO_MAX_DAYS_PER_CYCLE"]
+        assert field.default == 3
+
+    @pytest.mark.asyncio
+    async def test_weekends_and_feriados_are_not_requested(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        monkeypatch.setattr(probe.settings, "ESTADO_DIARIO_MAX_DAYS_PER_CYCLE", 30)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = date(2026, 10, 1)
+        db.commit()
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+        asked = [datetime.strptime(p, "%d/%m/%Y").date() for p in page.posted]
+        assert all(d.weekday() != 6 and d.weekday() != 5 for d in asked)
+        assert date(2026, 10, 12) not in asked  # feriado
+        assert asked == [date(2026, 10, d) for d in (2, 5, 6, 7, 8, 9, 13)]
+
+    @pytest.mark.asyncio
+    async def test_cooldown_tripping_mid_range_stops_the_range(
+        self, monkeypatch, limiter, db, log
+    ):
+        from app.services.shape_cooldown import get_shape_cooldown, reset_shape_cooldown
+
+        reset_shape_cooldown()
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+
+        def trip_after_first(fecha):
+            if fecha == "08/10/2026":
+                get_shape_cooldown().trip()
+
+        page = _day_page({}, on_post=trip_after_first)
+        try:
+            await _run_range(_scraper(page), db, lawyer)
+        finally:
+            reset_shape_cooldown()
+        assert page.posted == ["08/10/2026"]  # no further days requested
+        assert _watermark(db, lawyer) == date(2026, 10, 8)
+
+    @pytest.mark.asyncio
+    async def test_rows_of_every_day_read_are_returned(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        page = _day_page({
+            "08/10/2026": _resp(_table([("C-1-2026", "08/10/2026", "A/B", "1 Civil")])),
+            "13/10/2026": _resp(_table([("C-2-2026", "13/10/2026", "A/B", "1 Civil")])),
+        })
+        rows = await _run_range(_scraper(page), db, lawyer)
+        assert sorted(r.rol for r in rows) == ["C-1-2026", "C-2-2026"]
+
+    @pytest.mark.asyncio
+    async def test_one_pair_of_log_lines_per_day_with_unchanged_format(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        page = _day_page({
+            "08/10/2026": _resp(_table([("C-1-2026", "08/10/2026", "A/B", "1 Civil")])),
+        })
+        await _run_range(_scraper(page), db, lawyer)
+        lines = [l for l in _logged(log) if l.startswith("ESTADO_DIARIO_PROBE ")]
+        assert [re.search(r"date=(\S+)", l).group(1) for l in lines] == EXPECTED_3
+        assert f"lawyer={lawyer.id} date=08/10/2026 outcome=ok rows=1 in_db=0 " in lines[0]
+        assert "outcome=no_activity rows=0" in lines[1]
+
+    @pytest.mark.asyncio
+    async def test_each_request_goes_through_limiter_and_delay(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+        await _run_range(_scraper(_day_page({})), db, lawyer)
+        assert limiter.acquired == 3
+        assert probe.asyncio.sleep.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_unknown_lawyer_row_does_not_break_the_probe(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        page = _day_page({})
+        rows = await _run(_scraper(page), db)  # lawyer_id=8 has no row
+        assert page.posted == ["13/10/2026"]
+        assert rows == []
