@@ -85,4 +85,25 @@ export DOC_RECENT_DAYS="${DOC_RECENT:-30}"
 # station. Deferred PDFs stay `pending`, so nothing is lost.
 export DOC_HISTORICAL_ENABLED="${DOC_HISTORICAL:-true}"
 
+# Keep the Mac awake while the worker runs, ON AC POWER ONLY (-s): on battery it
+# sleeps normally, so this costs no autonomy. Measured 2026-10-16: the station
+# stayed awake 93% of four days only by ACCIDENT — Chrome, coreaudiod and a
+# stray caffeinate held the assertion, while `pmset -g` says `sleep 1`, one
+# minute of idle. On 16/10 those releases coincided with a scheduled cycle and
+# the Mac slept 25 minutes through it. A job that must run declares its own
+# requirement instead of inheriting someone else's.
+#
+# `-w $$` ties it to THIS pid, and `exec` below keeps that pid, so caffeinate
+# lives exactly as long as the worker and releases by itself when launchd stops
+# it. Do NOT wrap the plist's ProgramArguments in caffeinate instead: that makes
+# caffeinate the job process, breaking the "the job process IS the worker"
+# invariant, and a bootout could leave the python orphaned — two workers
+# scraping the same PJUD accounts.
+#
+# This does NOT cover a closed lid: macOS sleeps on lid close regardless. That
+# case needs the dedicated always-on station.
+if command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -s -w $$ &
+fi
+
 exec "$VENV" -m app.workers.sync_scheduler

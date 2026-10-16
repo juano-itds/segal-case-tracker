@@ -21,7 +21,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import OperationalError
@@ -1678,6 +1678,8 @@ def _select_cases_for_detail_rotation(
     api_cases: list,
     batch_size: int,
     reserved_first: bool = False,
+    priority_rols: Optional[Iterable[str]] = None,
+    priority_since: Optional[datetime] = None,
 ) -> list:
     """Select PJUDCase objects for detail scraping via DB-driven rotation.
 
@@ -1821,15 +1823,54 @@ def _select_cases_for_detail_rotation(
         _log_scope(len(fallback))
         return fallback
 
-    result = []
+    # Delta-sync: causas notified by the OJV estado-diario feed take up to
+    # ``feed_slots`` places of the batch (the CAP); the age rotation keeps the
+    # rest (the FLOOR, ``batch_size - feed_slots``). Unused feed slots go back
+    # to the rotation. Feed hits beyond the cap wait for a later cycle: they do
+    # NOT leak into the rotation slots, or 190 notified causas (measured
+    # 2026-10-15, lawyer 17) would still starve the forgotten queue.
+    feed_keys: set = set()
+    feed_slots = 0
+    if settings.DETAIL_FEED_PRIORITY_ENABLED and priority_rols:
+        feed_keys = {r.strip().upper() for r in priority_rols if r and r.strip()}
+        feed_slots = min(max(settings.DETAIL_FEED_MAX_PER_BATCH, 0), batch_size)
+
+    def _is_pending_feed_hit(db_case) -> bool:
+        if db_case.rol.strip().upper() not in feed_keys:
+            return False
+        # Already visited since the feed's date: it is an ordinary causa again,
+        # otherwise the same hits would hold the feed slots all day.
+        checked = db_case.last_detail_checked_at
+        return priority_since is None or checked is None or checked < priority_since
+
+    feed_picked: list = []
+    feed_waiting = 0
+    rotation_picked: list = []
     for db_case in db_cases:
         if not _year_ok(db_case.rol):
             continue
         api_case = api_lookup.get(db_case.rol.strip().upper())
-        if api_case is not None:
-            result.append(api_case)
-        if len(result) >= batch_size:
+        if api_case is None:
+            continue
+        if feed_keys and _is_pending_feed_hit(db_case):
+            if len(feed_picked) < feed_slots:
+                feed_picked.append(api_case)
+            else:
+                feed_waiting += 1
+            continue
+        rotation_picked.append(api_case)
+        if len(rotation_picked) >= batch_size and (
+            not feed_keys or len(feed_picked) >= feed_slots
+        ):
             break
+    result = (feed_picked + rotation_picked)[:batch_size]
+    if feed_keys:
+        logger.info(
+            "Detail rotation feed priority: lawyer_id=%s competencia=%s feed_rows=%d "
+            "feed_selected=%d feed_over_cap=%d rotation_selected=%d cap=%d",
+            lawyer_id, competencia, len(feed_keys), len(feed_picked), feed_waiting,
+            len(result) - len(feed_picked), feed_slots,
+        )
 
     # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived
     # cases removed from PJUD).  Those rows have NULL last_detail_checked_at so they

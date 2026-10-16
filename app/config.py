@@ -4,7 +4,7 @@ from functools import lru_cache
 from cryptography.fernet import Fernet, MultiFernet
 from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -232,6 +232,13 @@ class Settings(BaseSettings):
     # cycle, one log line, no effect on what the sync scrapes or alerts.
     # OFF by default: flip it in the environment to kill it without a deploy.
     ESTADO_DIARIO_PROBE_ENABLED: bool = False
+    # Max business days of the estado-diario feed one probe may request per
+    # lawyer per cycle. The probe asks for every business day since the last
+    # successful read (so a cycle skipped by the freshness guard leaves no hole),
+    # oldest first; each day is a PJUD request, so a lawyer who was away for
+    # weeks catches up over several cycles instead of in one burst. Env var,
+    # tunable without a deploy.
+    ESTADO_DIARIO_MAX_DAYS_PER_CYCLE: int = Field(default=3, ge=1)
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
@@ -240,6 +247,14 @@ class Settings(BaseSettings):
     # An unknown value FAILS AT STARTUP: silently degrading to "all" would make a
     # freshness station sweep the whole backlog.
     DETAIL_ROTATION_SCOPE: Literal["all", "fresh", "backlog"] = "all"
+    # Delta-sync: give the causas of the OJV estado-diario feed priority in the
+    # detail rotation, with a CAP (feed slots per batch) and a derived FLOOR
+    # (batch size - cap: slots the age rotation always keeps). OFF by default;
+    # with it off the selection is the one that existed before. It needs
+    # ESTADO_DIARIO_PROBE_ENABLED on, because the probe is what fetches the feed.
+    # The cap is a number to tune from real data, so it is an env var, not a constant.
+    DETAIL_FEED_PRIORITY_ENABLED: bool = False
+    DETAIL_FEED_MAX_PER_BATCH: int = Field(default=20, ge=0)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call

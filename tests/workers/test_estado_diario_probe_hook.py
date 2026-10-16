@@ -1,8 +1,9 @@
 """Where the estado-diario probe hooks into sync_lawyer_cases.
 
 The probe is observe-only. These tests pin that the cycle does exactly the
-same thing with the probe on or off, that it runs once and AFTER the detail
-phase, and that nothing it does can break the cycle.
+same thing with the probe on or off, that it runs once and BEFORE the rotation
+selection (delta-sync T1: the feed has to exist before the batch is chosen),
+and that nothing it does can break the cycle.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +29,12 @@ class _Harness:
 
         self.rotation = [MagicMock(), MagicMock()]
 
+        def select_effect(**kwargs):
+            self.calls.append("select")
+            return self.rotation
+
+        self._select_effect = select_effect
+
         async def detect(**kwargs):
             self.calls.append("detect")
             return (0, 0, list(mov_errors or []))
@@ -49,7 +56,7 @@ class _Harness:
              patch("app.workers.sync_scheduler.SyncService") as sync_service_cls, \
              patch(
                  "app.workers.sync_scheduler._select_cases_for_detail_rotation",
-                 return_value=self.rotation,
+                 side_effect=self._select_effect,
              ) as select, \
              patch("app.workers.sync_scheduler.detect_and_sync_movements", self.detect), \
              patch("app.workers.sync_scheduler.run_estado_diario_probe", self.probe), \
@@ -70,11 +77,11 @@ async def test_flag_off_never_calls_the_probe():
 
 
 @pytest.mark.asyncio
-async def test_flag_on_calls_the_probe_exactly_once_after_the_detail_phase():
+async def test_flag_on_calls_the_probe_exactly_once_before_the_rotation_selection():
     h = _Harness()
     await h.run(enabled=True)
     assert h.probe.await_count == 1
-    assert h.calls == ["detect", "probe"]
+    assert h.calls == ["probe", "select", "detect"]
     kwargs = h.probe.await_args.kwargs
     assert kwargs["scraper"] is h.scraper
     assert kwargs["lawyer_id"] == 1
@@ -108,8 +115,83 @@ async def test_a_probe_that_raises_does_not_break_the_cycle():
 
 
 @pytest.mark.asyncio
-async def test_no_probe_when_the_detail_phase_was_cut_short():
-    # A stopped batch (e.g. Shape block) means the IP is flagged: do not poke it more.
+async def test_a_failing_probe_leaves_the_selection_and_detail_phase_untouched():
+    h = _Harness(probe_effect=RuntimeError("probe blew up"))
+    result = await h.run(enabled=True)
+    assert result["success"] is True
+    assert h.calls == ["probe", "select", "detect"]
+    assert h.detect.await_args.kwargs["selected_cases"] is h.rotation
+
+
+@pytest.mark.asyncio
+async def test_the_probe_still_runs_when_the_batch_is_later_cut_short():
+    # The probe now runs BEFORE the batch, so a cut-short batch cannot gate it
+    # any more (it used to: a stopped batch meant a flagged IP). The Shape-block
+    # guard lives in the detail phase itself, which stops on its own.
     h = _Harness(mov_errors=["lote detenido: PJUD Shape challenge"])
     await h.run(enabled=True)
-    h.probe.assert_not_awaited()
+    h.probe.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Delta-sync T2: the feed rows reach the rotation selection
+# ---------------------------------------------------------------------------
+
+def _harness_returning(rows):
+    h = _Harness()
+
+    async def fake_probe(**kwargs):
+        h.calls.append("probe")
+        return rows
+
+    h.probe = AsyncMock(side_effect=fake_probe)
+    return h
+
+
+@pytest.mark.asyncio
+async def test_feed_rows_reach_the_selection_as_priority_rols():
+    from app.services.estado_diario_probe import FeedRow
+
+    h = _harness_returning([FeedRow("C-1-2026", "1 Civil"), FeedRow("C-2-2026", None)])
+    await h.run(enabled=True)
+    kwargs = h.select.call_args.kwargs
+    assert list(kwargs["priority_rols"]) == ["C-1-2026", "C-2-2026"]
+    assert kwargs["priority_since"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_raises_gives_the_selection_an_empty_feed():
+    h = _Harness(probe_effect=RuntimeError("probe blew up"))
+    result = await h.run(enabled=True)
+    assert result["success"] is True
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
+
+
+@pytest.mark.asyncio
+async def test_probe_flag_off_gives_the_selection_an_empty_feed():
+    h = _Harness()
+    await h.run(enabled=False)
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
+
+
+@pytest.mark.asyncio
+async def test_in_shape_cooldown_the_real_probe_does_not_navigate_and_rotation_gets_no_feed():
+    """End to end through the real probe (not the fake): cooldown active ->
+    no page.goto, and the selection still runs with an empty feed."""
+    from app.services.estado_diario_probe import run_estado_diario_probe
+    from app.services.shape_cooldown import get_shape_cooldown, reset_shape_cooldown
+
+    reset_shape_cooldown()
+    get_shape_cooldown().trip()
+    try:
+        h = _Harness()
+        h.page.goto = AsyncMock()
+        h.probe = AsyncMock(side_effect=run_estado_diario_probe)
+        result = await h.run(enabled=True)
+    finally:
+        reset_shape_cooldown()
+
+    assert result["success"] is True
+    h.page.goto.assert_not_awaited()
+    assert h.calls == ["select", "detect"]
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
