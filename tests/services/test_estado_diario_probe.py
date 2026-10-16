@@ -943,6 +943,35 @@ class TestBusinessDayRange:
         assert _watermark(db, lawyer) == date(2026, 10, 13)
 
     @pytest.mark.asyncio
+    async def test_a_watermark_that_cannot_be_saved_stops_the_range(
+        self, monkeypatch, limiter, db, log
+    ):
+        """A day read but NOT recorded must stop the range.
+
+        Carrying on would record a LATER day as the watermark, and the
+        unrecorded one would never be asked again: the exact permanent hole
+        this feature exists to close.
+        """
+        _enable(monkeypatch)
+        lawyer = _lawyer(db)
+        lawyer.estado_diario_last_read_on = LAST_READ
+        db.commit()
+
+        real_save = probe._save_watermark
+
+        def _fails_on_the_first_day(session_factory, lawyer_id, day):
+            if day == date(2026, 10, 8):
+                raise RuntimeError("database unavailable")
+            return real_save(session_factory, lawyer_id, day)
+
+        monkeypatch.setattr(probe, "_save_watermark", _fails_on_the_first_day)
+        page = _day_page({})
+        await _run_range(_scraper(page), db, lawyer)
+
+        assert page.posted == ["08/10/2026"]  # stopped; 09/10 and 13/10 untouched
+        assert _watermark(db, lawyer) == LAST_READ  # unchanged: nothing is skipped
+
+    @pytest.mark.asyncio
     async def test_a_failed_day_is_not_marked_read_and_is_asked_again(
         self, monkeypatch, limiter, db, log
     ):
