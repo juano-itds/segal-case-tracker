@@ -44,6 +44,7 @@ from app.scrapper.pjud.base import (
 )
 from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
 from app.services.business_days import previous_business_day
+from app.services.shape_cooldown import get_shape_cooldown
 
 logger = logging.getLogger("estado_diario_probe")
 
@@ -413,6 +414,17 @@ async def run_estado_diario_probe(
         return []
     rows: List[FeedRow] = []
     fecha = "?"
+    # Same guard the detail phase uses (detect_and_sync_movements): while Shape
+    # is challenging the station nothing may navigate, and the probe runs BEFORE
+    # that phase, so it cannot rely on the detail phase's own abstention.
+    cooldown = get_shape_cooldown()
+    if cooldown.active():
+        logger.info(
+            "ESTADO_DIARIO_PROBE lawyer=%s outcome=%s reason=shape_cooldown "
+            "remaining_s=%.0f",
+            lawyer_id, SKIPPED, cooldown.remaining(),
+        )
+        return []
     try:
         target = previous_business_day(today or date.today(), include_saturday=False)
         fecha = target.strftime("%d/%m/%Y")

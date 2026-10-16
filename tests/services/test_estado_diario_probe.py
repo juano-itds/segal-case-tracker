@@ -774,3 +774,54 @@ class TestReturnsItsRows:
             today=TODAY, now=NOW, session_factory=broken_factory,
         )
         assert rows == [probe.FeedRow(rol="C-1-2026", tribunal="1 Civil")]
+
+
+class TestShapeCooldown:
+    """While Shape is challenging the station, the probe must not navigate.
+
+    The detail phase already abstains in cooldown (detect_and_sync_movements);
+    now that the probe runs BEFORE it, the probe needs the same guard.
+    """
+
+    @pytest.fixture
+    def cooldown(self):
+        from app.services.shape_cooldown import get_shape_cooldown, reset_shape_cooldown
+
+        reset_shape_cooldown()
+        get_shape_cooldown().trip()
+        yield get_shape_cooldown()
+        reset_shape_cooldown()
+
+    @pytest.mark.asyncio
+    async def test_active_cooldown_means_no_navigation_no_request_no_rows(
+        self, monkeypatch, limiter, db, log, cooldown
+    ):
+        _enable(monkeypatch)
+        page = _page(_resp(_table([("C-1-2026", "13/10/2026", "A/B", "1 Civil")])))
+        rows = await _run(_scraper(page), db)
+
+        page.goto.assert_not_awaited()
+        page.evaluate.assert_not_awaited()
+        assert limiter.acquired == 0
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_active_cooldown_is_logged_under_the_probe_prefix(
+        self, monkeypatch, limiter, db, log, cooldown
+    ):
+        _enable(monkeypatch)
+        await _run(_scraper(_page(_resp(_table([])))), db)
+        line = _logged(log)[-1]
+        assert line.startswith("ESTADO_DIARIO_PROBE ")
+        assert "outcome=skipped" in line
+        assert "reason=shape_cooldown" in line
+
+    @pytest.mark.asyncio
+    async def test_inactive_cooldown_probes_as_usual(self, monkeypatch, limiter, db, log):
+        from app.services.shape_cooldown import reset_shape_cooldown
+
+        reset_shape_cooldown()
+        _enable(monkeypatch)
+        page = _page(_resp(_table([])))
+        await _run(_scraper(page), db)
+        page.goto.assert_awaited_once()

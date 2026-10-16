@@ -172,3 +172,26 @@ async def test_probe_flag_off_gives_the_selection_an_empty_feed():
     h = _Harness()
     await h.run(enabled=False)
     assert list(h.select.call_args.kwargs["priority_rols"]) == []
+
+
+@pytest.mark.asyncio
+async def test_in_shape_cooldown_the_real_probe_does_not_navigate_and_rotation_gets_no_feed():
+    """End to end through the real probe (not the fake): cooldown active ->
+    no page.goto, and the selection still runs with an empty feed."""
+    from app.services.estado_diario_probe import run_estado_diario_probe
+    from app.services.shape_cooldown import get_shape_cooldown, reset_shape_cooldown
+
+    reset_shape_cooldown()
+    get_shape_cooldown().trip()
+    try:
+        h = _Harness()
+        h.page.goto = AsyncMock()
+        h.probe = AsyncMock(side_effect=run_estado_diario_probe)
+        result = await h.run(enabled=True)
+    finally:
+        reset_shape_cooldown()
+
+    assert result["success"] is True
+    h.page.goto.assert_not_awaited()
+    assert h.calls == ["select", "detect"]
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
