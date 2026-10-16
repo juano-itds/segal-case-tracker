@@ -2,7 +2,8 @@
 
 ## Objetivo
 
-Que una causa que se movió en el PJUD se vea en horas, no en 17 días.
+Que una causa que se movió en el PJUD se vea en ~1 día en vez de 17 (ver la
+interacción con el guard de frescura en los pendientes conocidos).
 
 ## El problema medido
 
@@ -83,7 +84,7 @@ perdida      ~20 por abogado por dia = ~280 en el estudio
 ```
 
 A cambio, las 343 causas que **sabemos** que se movieron pasan de 17 días a
-horas. El backlog son causas donde probablemente no pasó nada; el feed son
+~1 día. El backlog son causas donde probablemente no pasó nada; el feed son
 causas donde pasó algo, y entre ellas están los plazos fatales que hoy
 descubrimos tarde.
 
@@ -159,3 +160,11 @@ Hallazgos al leer el código:
   `ROL + tribunal` (2.160 causas en un ROL repetido en otra corte).
 - El contador `not_in_db` del sondeo mezcla causas faltantes con causas
   pre-2021 que no ingerimos a propósito.
+- **El feed solo se lee para los abogados que el ciclo sincroniza.** El sondeo
+  corre dentro de `sync_lawyer_cases`, y el guard de frescura (`needs_sync` con
+  `MAX_DATA_AGE_HOURS`, `sync_scheduler.py`) saltea a los abogados frescos antes
+  de entrar. Medido en producción (2026-10-16): 20 de 25 salteados en un ciclo,
+  así que para ellos el feed no se lee. Una causa movida hoy se ve cuando a su
+  abogado le toca un ciclo real: del orden de un día, no de horas. Mover el
+  sondeo fuera del guard sería otro cambio (más sesiones y carga sobre el PJUD),
+  no autorizado en esta feature.
