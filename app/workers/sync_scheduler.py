@@ -13,7 +13,7 @@ Usage:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -672,18 +672,22 @@ async def sync_lawyer_cases(
             )
 
         # Probe of the OJV estado-diario feed. It runs BEFORE the rotation is
-        # chosen so the feed exists when the batch is picked (delta-sync). For
-        # now nobody consumes ``feed_rows``: the probe only logs. It runs after
-        # the listing upsert, so it cannot change what was listed, and nothing
-        # it does may break the cycle: a failure leaves the rotation exactly as
-        # it would be without the feed. Note it navigates the live page away
+        # chosen so the feed exists when the batch is picked (delta-sync). The
+        # rows feed the rotation only when DETAIL_FEED_PRIORITY_ENABLED is on;
+        # otherwise the probe just logs. It runs after the listing upsert, so
+        # it cannot change what was listed, and nothing it does may break the
+        # cycle: a failure leaves the rotation exactly as it would be without
+        # the feed. Note it navigates the live page away
         # from the Mis Causas panel; the detail phase re-loads the panel by
         # itself (``_ensure_panel_loaded``) before its first fetch.
         feed_rows: list = []
         if settings.ESTADO_DIARIO_PROBE_ENABLED:
             try:
-                feed_rows = await run_estado_diario_probe(
-                    scraper=scraper, lawyer_id=lawyer_id, competencia=competencia
+                feed_rows = (
+                    await run_estado_diario_probe(
+                        scraper=scraper, lawyer_id=lawyer_id, competencia=competencia
+                    )
+                    or []
                 )
             except Exception:  # noqa: BLE001 — a probe failure never breaks the cycle
                 logger.exception("estado-diario probe failed (non-fatal)")
@@ -698,6 +702,11 @@ async def sync_lawyer_cases(
             competencia=competencia,
             api_cases=cases,
             batch_size=settings.DETAIL_BATCH_SIZE,
+            # Ignored by the selection unless DETAIL_FEED_PRIORITY_ENABLED is on.
+            # A causa visited since the start of today (UTC, like every
+            # ``last_detail_checked_at``) has already consumed its feed entry.
+            priority_rols=[row.rol for row in feed_rows],
+            priority_since=datetime.combine(datetime.utcnow().date(), time.min),
         )
 
         # S4-T3/S4-T5: movement detection — reuse the shared implementation.

@@ -131,3 +131,44 @@ async def test_the_probe_still_runs_when_the_batch_is_later_cut_short():
     h = _Harness(mov_errors=["lote detenido: PJUD Shape challenge"])
     await h.run(enabled=True)
     h.probe.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Delta-sync T2: the feed rows reach the rotation selection
+# ---------------------------------------------------------------------------
+
+def _harness_returning(rows):
+    h = _Harness()
+
+    async def fake_probe(**kwargs):
+        h.calls.append("probe")
+        return rows
+
+    h.probe = AsyncMock(side_effect=fake_probe)
+    return h
+
+
+@pytest.mark.asyncio
+async def test_feed_rows_reach_the_selection_as_priority_rols():
+    from app.services.estado_diario_probe import FeedRow
+
+    h = _harness_returning([FeedRow("C-1-2026", "1 Civil"), FeedRow("C-2-2026", None)])
+    await h.run(enabled=True)
+    kwargs = h.select.call_args.kwargs
+    assert list(kwargs["priority_rols"]) == ["C-1-2026", "C-2-2026"]
+    assert kwargs["priority_since"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_raises_gives_the_selection_an_empty_feed():
+    h = _Harness(probe_effect=RuntimeError("probe blew up"))
+    result = await h.run(enabled=True)
+    assert result["success"] is True
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
+
+
+@pytest.mark.asyncio
+async def test_probe_flag_off_gives_the_selection_an_empty_feed():
+    h = _Harness()
+    await h.run(enabled=False)
+    assert list(h.select.call_args.kwargs["priority_rols"]) == []
