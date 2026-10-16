@@ -178,7 +178,9 @@ ACTIONABLE_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in ACTIONAB
 # only actionable for ONE side, so "actionable and fatal" must be evaluated
 # against the per-side ``actionable_sets``, never against the global
 # ACTIONABLE_DEADLINE_VALUES (which is the demandante view).
-FATAL_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in DeadlineType if d.is_fatal)
+FATAL_DEADLINE_VALUES: frozenset[str] = frozenset(
+    d.value for d in DeadlineType if d.is_fatal  # type: ignore[attr-defined]
+)
 
 
 def actionable_sets(side: str) -> "tuple[frozenset[str], frozenset[str]]":
