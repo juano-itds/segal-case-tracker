@@ -1,11 +1,15 @@
-"""Movements detected during the previous Chilean calendar day for Sysgal."""
+"""Daily and resumable movement feed for Sysgal."""
 
+import base64
+import binascii
+import json
 from datetime import datetime, time, timedelta, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -40,10 +44,12 @@ class SysgalMovimientoItem(BaseModel):
 
 
 class SysgalMovimientosResponse(BaseModel):
-    fecha_deteccion: str
+    fecha_deteccion: Optional[str] = None
     total: int
     page: int
     per_page: int
+    next_cursor: Optional[str] = None
+    has_more: bool
     items: List[SysgalMovimientoItem]
 
 
@@ -62,6 +68,40 @@ def _previous_chilean_day_bounds(
     start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
     return start_utc, end_utc, target.isoformat()
+
+
+def _encode_cursor(created_at: datetime, movement_id: int) -> str:
+    """Encode an exclusive ``(created_at, id)`` position as URL-safe text."""
+    timestamp = created_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    raw = json.dumps([timestamp, movement_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, int]:
+    """Decode and validate a cursor produced by :func:`_encode_cursor`."""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        timestamp, movement_id = json.loads(
+            base64.urlsafe_b64decode(padded.encode()).decode()
+        )
+        parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if (
+            parsed.tzinfo is None
+            or isinstance(movement_id, bool)
+            or not isinstance(movement_id, int)
+        ):
+            raise ValueError
+        if movement_id < 0:
+            raise ValueError
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None), movement_id
+    except (
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise HTTPException(status_code=422, detail="Cursor 'desde' inválido") from exc
 
 
 def _client_ruts_by_case(db: Session, case_ids: list[int]) -> dict[int, str]:
@@ -120,6 +160,10 @@ def _client_ruts_by_case(db: Session, case_ids: list[int]) -> dict[int, str]:
 
 @router.get("/movimientos", response_model=SysgalMovimientosResponse)
 def list_previous_day_movements(
+    desde: Optional[str] = Query(
+        None,
+        description="Cursor entregado como next_cursor por una respuesta anterior",
+    ),
     page: int = Query(1, ge=1, description="Página solicitada"),
     per_page: int = Query(
         100,
@@ -130,21 +174,35 @@ def list_previous_day_movements(
     db: Session = Depends(get_db),
     _key=Depends(require_sysgal_key),
 ) -> SysgalMovimientosResponse:
-    """List movements first detected during yesterday in Chile.
+    """List newly detected movements, either for yesterday or after a cursor.
 
-    Reads directly from ``movements`` and includes its associated case, the
-    best available client RUT, and the linked document URL/storage path.
+    Without ``desde``, returns the closed Chilean calendar day of yesterday in
+    descending order. With ``desde``, returns every movement after that
+    exclusive ``(created_at, id)`` position in ascending order, allowing a
+    consumer that was offline for several days to resume without gaps.
     """
-    start_utc, end_utc, target = _previous_chilean_day_bounds()
-    base_query = (
-        db.query(Movement, Case)
-        .join(Case, Case.id == Movement.case_id)
-        .filter(Movement.created_at >= start_utc, Movement.created_at < end_utc)
-    )
+    base_query = db.query(Movement, Case).join(Case, Case.id == Movement.case_id)
+    target = None
+    if desde:
+        cursor_at, cursor_id = _decode_cursor(desde)
+        base_query = base_query.filter(
+            or_(
+                Movement.created_at > cursor_at,
+                and_(Movement.created_at == cursor_at, Movement.id > cursor_id),
+            )
+        )
+        ordering = (Movement.created_at.asc(), Movement.id.asc())
+    else:
+        start_utc, end_utc, target = _previous_chilean_day_bounds()
+        base_query = base_query.filter(
+            Movement.created_at >= start_utc, Movement.created_at < end_utc
+        )
+        ordering = (Movement.created_at.desc(), Movement.id.desc())
+
     total = base_query.count()
     rows = (
         base_query
-        .order_by(Movement.created_at.desc(), Movement.id.desc())
+        .order_by(*ordering)
         .offset((page - 1) * per_page)
         .limit(per_page)
         .all()
@@ -188,10 +246,29 @@ def list_previous_day_movements(
             )
         )
 
+    has_more = page * per_page < total
+    next_cursor = None
+    if desde and items:
+        last_movement = rows[-1][0]
+        next_cursor = _encode_cursor(last_movement.created_at, last_movement.id)
+    elif not desde and items and not has_more:
+        # Bootstrap resumable consumption only after the caller reaches the
+        # final daily page. The mark is the newest row in the whole closed
+        # window, not the oldest row that happens to be on the final page.
+        newest = (
+            base_query.order_by(Movement.created_at.desc(), Movement.id.desc())
+            .limit(1)
+            .first()
+        )
+        if newest:
+            next_cursor = _encode_cursor(newest[0].created_at, newest[0].id)
+
     return SysgalMovimientosResponse(
         fecha_deteccion=target,
         total=total,
         page=page,
         per_page=per_page,
+        next_cursor=next_cursor,
+        has_more=has_more,
         items=items,
     )
