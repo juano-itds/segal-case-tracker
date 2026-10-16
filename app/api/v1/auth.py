@@ -114,6 +114,16 @@ class SetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
+class ChangePasswordRequest(BaseModel):
+    """Request to change the authenticated user's OWN app-level password.
+
+    Deliberately carries no identity field: the account always comes from the
+    JWT, never from the body.
+    """
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
@@ -307,6 +317,39 @@ def set_password(
     ).first()
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
+    lawyer.password_hash = hash_password(body.new_password)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/change-password", status_code=200)
+def change_own_password(
+    body: ChangePasswordRequest,
+    rut: str = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """
+    Change the authenticated user's own app-level password.
+
+    The account is resolved from the session (JWT), never from the request.
+    Requires the current password. Any credential mismatch returns the same
+    generic error as web-login. The passwords are never logged.
+    """
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == rut).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    if not lawyer.password_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="Tu cuenta no tiene contraseña configurada; pide a un administrador que la establezca",
+        )
+    if not verify_password(body.current_password, lawyer.password_hash):
+        raise HTTPException(status_code=400, detail="Credenciales inválidas")
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=400,
+            detail="La contraseña nueva debe ser distinta de la actual",
+        )
     lawyer.password_hash = hash_password(body.new_password)
     db.commit()
     return {"ok": True}
