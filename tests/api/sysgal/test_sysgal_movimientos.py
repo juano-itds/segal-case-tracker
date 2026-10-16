@@ -127,7 +127,8 @@ def test_returns_only_movements_detected_yesterday_with_case_client_and_document
     payload = response.json()
     assert payload["fecha_deteccion"] == target
     assert payload["total"] == 2
-    assert payload["limit"] == 100
+    assert payload["page"] == 1
+    assert payload["per_page"] == 100
     assert [item["folio"] for item in payload["items"]] == ["2", "1"]
     assert all(item["rol"] == "C-123-2026" for item in payload["items"])
     assert all(item["rut_cliente"] == "18765432-1" for item in payload["items"])
@@ -139,14 +140,25 @@ def test_returns_only_movements_detected_yesterday_with_case_client_and_document
     assert earliest["documento_ruta"] == "gs://bucket/resolucion.pdf"
 
 
-def test_limit_is_applied_and_bounded(client, db):
+def test_pagination_is_applied_bounded_and_reports_real_total(client, db):
     _seed_key(db)
     _seed(db)
 
-    response = client.get(URL, params={"limit": 1}, headers=_auth())
+    response = client.get(URL, params={"page": 1, "per_page": 1}, headers=_auth())
     assert response.status_code == 200
-    assert response.json()["total"] == 1
-    assert response.json()["limit"] == 1
+    assert response.json()["total"] == 2
+    assert response.json()["page"] == 1
+    assert response.json()["per_page"] == 1
+    assert len(response.json()["items"]) == 1
 
-    assert client.get(URL, params={"limit": 0}, headers=_auth()).status_code == 422
-    assert client.get(URL, params={"limit": 1001}, headers=_auth()).status_code == 422
+    second_page = client.get(
+        URL, params={"page": 2, "per_page": 1}, headers=_auth()
+    )
+    assert second_page.status_code == 200
+    assert second_page.json()["total"] == 2
+    assert second_page.json()["page"] == 2
+    assert second_page.json()["items"][0]["folio"] == "1"
+
+    assert client.get(URL, params={"page": 0}, headers=_auth()).status_code == 422
+    assert client.get(URL, params={"per_page": 0}, headers=_auth()).status_code == 422
+    assert client.get(URL, params={"per_page": 1001}, headers=_auth()).status_code == 422

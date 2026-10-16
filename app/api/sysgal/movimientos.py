@@ -42,7 +42,8 @@ class SysgalMovimientoItem(BaseModel):
 class SysgalMovimientosResponse(BaseModel):
     fecha_deteccion: str
     total: int
-    limit: int
+    page: int
+    per_page: int
     items: List[SysgalMovimientoItem]
 
 
@@ -119,7 +120,13 @@ def _client_ruts_by_case(db: Session, case_ids: list[int]) -> dict[int, str]:
 
 @router.get("/movimientos", response_model=SysgalMovimientosResponse)
 def list_previous_day_movements(
-    limit: int = Query(100, ge=1, le=1000, description="Cantidad máxima de movimientos"),
+    page: int = Query(1, ge=1, description="Página solicitada"),
+    per_page: int = Query(
+        100,
+        ge=1,
+        le=1000,
+        description="Cantidad máxima de movimientos por página",
+    ),
     db: Session = Depends(get_db),
     _key=Depends(require_sysgal_key),
 ) -> SysgalMovimientosResponse:
@@ -129,12 +136,17 @@ def list_previous_day_movements(
     best available client RUT, and the linked document URL/storage path.
     """
     start_utc, end_utc, target = _previous_chilean_day_bounds()
-    rows = (
+    base_query = (
         db.query(Movement, Case)
         .join(Case, Case.id == Movement.case_id)
         .filter(Movement.created_at >= start_utc, Movement.created_at < end_utc)
+    )
+    total = base_query.count()
+    rows = (
+        base_query
         .order_by(Movement.created_at.desc(), Movement.id.desc())
-        .limit(limit)
+        .offset((page - 1) * per_page)
+        .limit(per_page)
         .all()
     )
 
@@ -178,7 +190,8 @@ def list_previous_day_movements(
 
     return SysgalMovimientosResponse(
         fecha_deteccion=target,
-        total=len(items),
-        limit=limit,
+        total=total,
+        page=page,
+        per_page=per_page,
         items=items,
     )
