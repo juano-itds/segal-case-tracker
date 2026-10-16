@@ -117,6 +117,15 @@ Y `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
 - [x] **T2** — La selección de rotación acepta un conjunto de ROL prioritarios
       con tope y piso. Flag apagado por defecto.
 - [ ] **T3** — Medición: comparar la demora antes y después sobre datos reales.
+- [ ] **T4** — El sondeo pide el rango de días hábiles desde la última lectura
+      exitosa de ese abogado, no solo el día hábil anterior, para que un ciclo
+      salteado no deje un agujero silencioso. Hace falta recordar por abogado
+      cuándo fue la última lectura exitosa del feed (hoy no se persiste nada del
+      sondeo). El rango tiene que tener tope: si un abogado estuvo semanas sin
+      sincronizar no se pueden pedir treinta días de una; el tope es necesario y
+      el número hay que medirlo. **Conviene que entre antes de prender el flag en
+      producción**: si no, el delta-sync tendría agujeros justo en los abogados
+      que menos se sincronizan, que son los que más lo necesitan.
 
 ## Progreso
 
@@ -167,4 +176,5 @@ Hallazgos al leer el código:
   así que para ellos el feed no se lee. Una causa movida hoy se ve cuando a su
   abogado le toca un ciclo real: del orden de un día, no de horas. Mover el
   sondeo fuera del guard sería otro cambio (más sesiones y carga sobre el PJUD),
-  no autorizado en esta feature.
+  no autorizado en esta feature. El agujero que esto deja entre ciclos (el
+  sondeo pide un solo día hábil) se trata en T4.
