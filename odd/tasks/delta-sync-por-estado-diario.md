@@ -110,10 +110,10 @@ Y `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
 
 ## Tareas
 
-- [ ] **T1** — El sondeo devuelve sus filas en vez de descartarlas, y corre
+- [x] **T1** — El sondeo devuelve sus filas en vez de descartarlas, y corre
       ANTES de la rotación. Sin cambio de comportamiento: la lista se obtiene y
       se loguea, nadie la usa todavía.
-- [ ] **T2** — La selección de rotación acepta un conjunto de ROL prioritarios
+- [x] **T2** — La selección de rotación acepta un conjunto de ROL prioritarios
       con tope y piso. Flag apagado por defecto.
 - [ ] **T3** — Medición: comparar la demora antes y después sobre datos reales.
 
@@ -121,6 +121,34 @@ Y `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
 
 Documento creado 2026-10-16 tras el mapeo. Diseño acordado con Marcelo:
 tope 20 / piso 10, configurable, detrás de flag.
+
+**T1 y T2 hechas (2026-10-16).** Flags: `DETAIL_FEED_PRIORITY_ENABLED` (false) y
+`DETAIL_FEED_MAX_PER_BATCH` (20). Requiere `ESTADO_DIARIO_PROBE_ENABLED=true`:
+el sondeo es lo que trae el feed.
+
+Hallazgos al leer el código:
+
+- El sondeo hace `page.goto(/miEstadoDiario.php)`: al correr antes del detalle
+  saca la página del panel Mis Causas. El detalle se recupera solo
+  (`_ensure_panel_loaded` verifica que exista la función), a costa de recargar
+  el panel una vez por abogado. El comentario "navegar no cuesta nada" ya no vale.
+- Mover el sondeo antes del detalle elimina su guarda `not stop_reason` (no existe
+  todavía). Un lote cortado por Shape ya no impide el sondeo; la guarda real
+  está en el detalle. El test que lo fijaba cambió.
+- Los números de `ESTADO_DIARIO_PROBE` cambian: antes la antigüedad se medía
+  después del detalle (las causas del lote aparecían recién miradas). Ahora se
+  mide antes, sin ese sesgo. Es mejora, no regresión.
+- Sin un criterio de "consumido" el feed ocuparía 20 plazas todo el día: la causa
+  ya visitada desde el inicio del día (UTC) deja de contar como feed. Es un
+  agregado al diseño; sin él no se cumple "siguientes ciclos: 30".
+- Los hits del feed sobre el tope no se derraman a las plazas de rotación: si
+  no, las 190 del abogado 17 seguirían comiéndose la cola.
+- Si el abogado casi no tiene causas fuera del feed, el lote queda corto (el tope
+  manda sobre el aprovechamiento).
+- El cruce es por ROL normalizado, no por tribunal: el mismo ROL en otra corte
+  del mismo abogado también se prioriza (bug de identidad conocido).
+- `DETAIL_FEED_MAX_PER_BATCH >= DETAIL_BATCH_SIZE` anula el piso (el piso es
+  derivado: `batch - tope`).
 
 ## Pendientes conocidos, fuera de esta feature
 
