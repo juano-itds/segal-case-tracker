@@ -44,6 +44,7 @@ from app.scrapper.pjud.base import (
 )
 from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
 from app.services.business_days import previous_business_day
+from app.services.shape_cooldown import get_shape_cooldown
 
 logger = logging.getLogger("estado_diario_probe")
 
@@ -62,8 +63,9 @@ ENDPOINT = "/miEstadoDiario/civil/estadoDiarioFechaCivil.php"
 # capture of this endpoint recorded this loader as part of the flow. POSTing
 # cold from whatever page the detail phase left behind risks a rejection we
 # would read as "the endpoint is dead" -- and this feed was already written
-# off once by mistake, for three months. Navigating costs nothing here: the
-# browser is torn down between lawyers anyway.
+# off once by mistake, for three months. Navigating leaves the page off the
+# Mis Causas panel; the cycle runs the probe before the detail phase, which
+# re-loads the panel by itself (``_ensure_panel_loaded``) before its first fetch.
 LOADER = "/miEstadoDiario.php"
 _BOUNCE_STATUSES = (401, 403)
 
@@ -398,13 +400,31 @@ async def run_estado_diario_probe(
     today: Optional[date] = None,
     now: Optional[datetime] = None,
     session_factory: Callable = SessionLocal,
-) -> None:
-    """Probe once and log once. Never raises; does nothing when the flag is off."""
+) -> List[FeedRow]:
+    """Probe once, log once, and hand back the feed rows.
+
+    Never raises. Returns ``[]`` whenever there is nothing usable: flag off,
+    non-civil, no live page, no activity, bounced, endpoint changed or our own
+    failure. The rows are returned as soon as the response classifies as ``ok``,
+    so a failure in the log statistics that follow does not lose them.
+    """
     if not settings.ESTADO_DIARIO_PROBE_ENABLED:
-        return
+        return []
     if (competencia or "").lower() != "civil":
-        return
+        return []
+    rows: List[FeedRow] = []
     fecha = "?"
+    # Same guard the detail phase uses (detect_and_sync_movements): while Shape
+    # is challenging the station nothing may navigate, and the probe runs BEFORE
+    # that phase, so it cannot rely on the detail phase's own abstention.
+    cooldown = get_shape_cooldown()
+    if cooldown.active():
+        logger.info(
+            "ESTADO_DIARIO_PROBE lawyer=%s outcome=%s reason=shape_cooldown "
+            "remaining_s=%.0f",
+            lawyer_id, SKIPPED, cooldown.remaining(),
+        )
+        return []
     try:
         target = previous_business_day(today or date.today(), include_saturday=False)
         fecha = target.strftime("%d/%m/%Y")
@@ -415,13 +435,14 @@ async def run_estado_diario_probe(
                 "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s reason=no_live_page",
                 lawyer_id, fecha, SKIPPED,
             )
-            return
+            return []
 
         await pjud_action_limiter("estado_diario").acquire()
         await asyncio.sleep(settings.DETAIL_FETCH_DELAY)
         result = classify_response(await fetch_estado_diario(page, fecha))
 
         if result.outcome == OK:
+            rows = list(result.rows)
             stats = staleness_stats(
                 session_factory, result.rows, now or datetime.utcnow(), lawyer_id
             )
@@ -453,3 +474,4 @@ async def run_estado_diario_probe(
             "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s error=%s: %s",
             lawyer_id, fecha, PROBE_ERROR, type(exc).__name__, exc,
         )
+    return rows
