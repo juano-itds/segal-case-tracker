@@ -398,12 +398,19 @@ async def run_estado_diario_probe(
     today: Optional[date] = None,
     now: Optional[datetime] = None,
     session_factory: Callable = SessionLocal,
-) -> None:
-    """Probe once and log once. Never raises; does nothing when the flag is off."""
+) -> List[FeedRow]:
+    """Probe once, log once, and hand back the feed rows.
+
+    Never raises. Returns ``[]`` whenever there is nothing usable: flag off,
+    non-civil, no live page, no activity, bounced, endpoint changed or our own
+    failure. The rows are returned as soon as the response classifies as ``ok``,
+    so a failure in the log statistics that follow does not lose them.
+    """
     if not settings.ESTADO_DIARIO_PROBE_ENABLED:
-        return
+        return []
     if (competencia or "").lower() != "civil":
-        return
+        return []
+    rows: List[FeedRow] = []
     fecha = "?"
     try:
         target = previous_business_day(today or date.today(), include_saturday=False)
@@ -415,13 +422,14 @@ async def run_estado_diario_probe(
                 "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s reason=no_live_page",
                 lawyer_id, fecha, SKIPPED,
             )
-            return
+            return []
 
         await pjud_action_limiter("estado_diario").acquire()
         await asyncio.sleep(settings.DETAIL_FETCH_DELAY)
         result = classify_response(await fetch_estado_diario(page, fecha))
 
         if result.outcome == OK:
+            rows = list(result.rows)
             stats = staleness_stats(
                 session_factory, result.rows, now or datetime.utcnow(), lawyer_id
             )
@@ -453,3 +461,4 @@ async def run_estado_diario_probe(
             "ESTADO_DIARIO_PROBE lawyer=%s date=%s outcome=%s error=%s: %s",
             lawyer_id, fecha, PROBE_ERROR, type(exc).__name__, exc,
         )
+    return rows

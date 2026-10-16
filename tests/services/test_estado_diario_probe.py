@@ -718,3 +718,59 @@ class TestFailureIsolation:
             today=TODAY, now=NOW, session_factory=broken,
         )
         assert "outcome=probe_error" in _logged(log)[-1]
+
+
+class TestReturnsItsRows:
+    """The probe hands the feed back to the caller (delta-sync T1)."""
+
+    @pytest.mark.asyncio
+    async def test_ok_returns_the_feed_rows_with_their_tribunal(
+        self, monkeypatch, limiter, db, log
+    ):
+        _enable(monkeypatch)
+        body = _table([
+            ("C-1-2026", "13/10/2026", "A/B", "1 Civil"),
+            ("C-2-2026", "13/10/2026", "A/B", "2 Civil"),
+        ])
+        rows = await _run(_scraper(_page(_resp(body))), db)
+        assert rows == [
+            probe.FeedRow(rol="C-1-2026", tribunal="1 Civil"),
+            probe.FeedRow(rol="C-2-2026", tribunal="2 Civil"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_returns_no_rows(self, monkeypatch, limiter, db):
+        _enable(monkeypatch, False)
+        assert await _run(_scraper(_page(_resp(_table([])))), db) == []
+
+    @pytest.mark.asyncio
+    async def test_no_activity_returns_no_rows(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        assert await _run(_scraper(_page(_resp(_table([])))), db) == []
+
+    @pytest.mark.asyncio
+    async def test_bounced_returns_no_rows(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        assert await _run(_scraper(_page(_resp(SHAPE_PAGE))), db) == []
+
+    @pytest.mark.asyncio
+    async def test_internal_failure_returns_no_rows(self, monkeypatch, limiter, db, log):
+        _enable(monkeypatch)
+        assert await _run(_scraper(_page(RuntimeError("boom"))), db) == []
+
+    @pytest.mark.asyncio
+    async def test_stats_failure_after_a_good_response_still_returns_the_rows(
+        self, monkeypatch, limiter, db, log
+    ):
+        """The rows are the product; the log statistics are a by-product."""
+        _enable(monkeypatch)
+        body = _table([("C-1-2026", "13/10/2026", "A/B", "1 Civil")])
+
+        def broken_factory():
+            raise RuntimeError("db down")
+
+        rows = await probe.run_estado_diario_probe(
+            scraper=_scraper(_page(_resp(body))), lawyer_id=8, competencia="civil",
+            today=TODAY, now=NOW, session_factory=broken_factory,
+        )
+        assert rows == [probe.FeedRow(rol="C-1-2026", tribunal="1 Civil")]
